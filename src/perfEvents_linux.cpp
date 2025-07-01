@@ -25,19 +25,24 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
 #include "arch.h"
+#include "j9StackTraces.h"
 #include "log.h"
 #include "os.h"
 #include "perfEvents.h"
+#include "fdtransferClient.h"
 #include "profiler.h"
 #include "spinLock.h"
 #include "stackFrame.h"
+#include "stackWalker.h"
 #include "symbols.h"
+#include "vmStructs.h"
 
 
 // Ancient fcntl.h does not define F_SETOWN_EX constants and structures
@@ -146,6 +151,34 @@ static bool setPmuConfig(const char* device, const char* param, __u64* config, _
 }
 
 
+static const void** _pthread_entry = NULL;
+
+// Intercept thread creation/termination by patching libjvm's GOT entry for pthread_setspecific().
+// HotSpot puts VMThread into TLS on thread start, and resets on thread end.
+static int pthread_setspecific_hook(pthread_key_t key, const void* value) {
+    if (key != VMThread::key()) {
+        return pthread_setspecific(key, value);
+    }
+    if (pthread_getspecific(key) == value) {
+        return 0;
+    }
+
+    if (value != NULL) {
+        int result = pthread_setspecific(key, value);
+        PerfEvents::createForThread(OS::threadId());
+        return result;
+    } else {
+        PerfEvents::destroyForThread(OS::threadId());
+        return pthread_setspecific(key, value);
+    }
+}
+
+static const void** lookupThreadEntry() {
+    CodeCache* lib = Profiler::instance()->findJvmLibrary("libj9thr");
+    return lib != NULL ? lib->findGlobalOffsetEntry((const void*)&pthread_setspecific) : NULL;
+}
+
+
 struct FunctionWithCounter {
     const char* name;
     int counter_arg;
@@ -239,6 +272,10 @@ struct PerfEventType {
             addr = (__u64)(uintptr_t)dlsym(RTLD_DEFAULT, buf);
             if (addr == 0) {
                 addr = (__u64)(uintptr_t)Profiler::instance()->resolveSymbol(buf);
+            }
+            if (c == NULL) {
+                // If offset is not specified explicitly, add the default breakpoint offset
+                offset = BREAKPOINT_OFFSET;
             }
         }
 
@@ -508,6 +545,12 @@ int PerfEvents::createForThread(int tid) {
         return -1;
     }
 
+    // Mark _events[tid] early to prevent duplicates. Real fd will be put later.
+    if (!__sync_bool_compare_and_swap(&_events[tid]._fd, 0, -1)) {
+        // Lost race. The event is created either from PerfEvents::start() or from pthread hook.
+        return -1;
+    }
+
     struct perf_event_attr attr = {0};
     attr.size = sizeof(attr);
     attr.type = event_type->type;
@@ -536,6 +579,10 @@ int PerfEvents::createForThread(int tid) {
         attr.exclude_user = 1;
     }
 
+    if (_cstack == CSTACK_DWARF) {
+        attr.exclude_callchain_user = 1;
+    }
+
 #ifdef PERF_ATTR_SIZE_VER5
     if (_cstack == CSTACK_LBR) {
         attr.sample_type |= PERF_SAMPLE_BRANCH_STACK | PERF_SAMPLE_REGS_USER;
@@ -547,17 +594,17 @@ int PerfEvents::createForThread(int tid) {
 #warning "Compiling without LBR support. Kernel headers 4.1+ required"
 #endif
 
-    int fd = syscall(__NR_perf_event_open, &attr, tid, -1, -1, 0);
-    if (fd == -1) {
-        int err = errno;
-        Log::warn("perf_event_open failed: %s", strerror(errno));
-        return err;
+    int fd;
+    if (FdTransferClient::hasPeer()) {
+        fd = FdTransferClient::requestPerfFd(&tid, &attr);
+    } else {
+        fd = syscall(__NR_perf_event_open, &attr, tid, -1, -1, 0);
     }
 
-    if (!__sync_bool_compare_and_swap(&_events[tid]._fd, 0, fd)) {
-        // Lost race. The event is created either from start() or from onThreadStart()
-        close(fd);
-        return -1;
+    if (fd == -1) {
+        int err = errno;
+        Log::warn("perf_event_open for TID %d failed: %s", tid, strerror(errno));
+        return err;
     }
 
     void* page = mmap(NULL, 2 * OS::page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -567,6 +614,7 @@ int PerfEvents::createForThread(int tid) {
     }
 
     _events[tid].reset();
+    _events[tid]._fd = fd;
     _events[tid]._page = (struct perf_event_mmap_page*)page;
 
     struct f_owner_ex ex;
@@ -590,7 +638,7 @@ void PerfEvents::destroyForThread(int tid) {
 
     PerfEvent* event = &_events[tid];
     int fd = event->_fd;
-    if (fd != 0 && __sync_bool_compare_and_swap(&event->_fd, fd, 0)) {
+    if (fd > 0 && __sync_bool_compare_and_swap(&event->_fd, fd, 0)) {
         ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
         close(fd);
     }
@@ -602,6 +650,19 @@ void PerfEvents::destroyForThread(int tid) {
     }
 }
 
+u64 PerfEvents::readCounter(siginfo_t* siginfo, void* ucontext) {
+    switch (_event_type->counter_arg) {
+        case 1: return StackFrame(ucontext).arg0();
+        case 2: return StackFrame(ucontext).arg1();
+        case 3: return StackFrame(ucontext).arg2();
+        case 4: return StackFrame(ucontext).arg3();
+        default: {
+            u64 counter;
+            return read(siginfo->si_fd, &counter, sizeof(counter)) == sizeof(counter) ? counter : 1;
+        }
+    }
+}
+
 void PerfEvents::signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     if (siginfo->si_code <= 0) {
         // Looks like an external signal; don't treat as a profiling event
@@ -609,20 +670,31 @@ void PerfEvents::signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     }
 
     if (_enabled) {
-        u64 counter;
-        switch (_event_type->counter_arg) {
-            case 1: counter = StackFrame(ucontext).arg0(); break;
-            case 2: counter = StackFrame(ucontext).arg1(); break;
-            case 3: counter = StackFrame(ucontext).arg2(); break;
-            case 4: counter = StackFrame(ucontext).arg3(); break;
-            default:
-                if (read(siginfo->si_fd, &counter, sizeof(counter)) != sizeof(counter)) {
-                    counter = 1;
-                }
-        }
-
+        u64 counter = readCounter(siginfo, ucontext);
         ExecutionEvent event;
         Profiler::instance()->recordSample(ucontext, counter, 0, &event);
+    } else {
+        resetBuffer(OS::threadId());
+    }
+
+    ioctl(siginfo->si_fd, PERF_EVENT_IOC_RESET, 0);
+    ioctl(siginfo->si_fd, PERF_EVENT_IOC_REFRESH, 1);
+}
+
+void PerfEvents::signalHandlerJ9(int signo, siginfo_t* siginfo, void* ucontext) {
+    if (siginfo->si_code <= 0) {
+        // Looks like an external signal; don't treat as a profiling event
+        return;
+    }
+
+    if (_enabled) {
+        u64 counter = readCounter(siginfo, ucontext);
+        J9StackTraceNotification notif;
+        notif.num_frames = _cstack == CSTACK_NO ? 0 : walk(OS::threadId(), notif.addr, MAX_J9_NATIVE_FRAMES);
+        if (_cstack == CSTACK_DWARF) {
+            notif.num_frames += StackWalker::walkDwarf(ucontext, notif.addr + notif.num_frames, MAX_J9_NATIVE_FRAMES - notif.num_frames);
+        }
+        J9StackTraces::checkpoint(counter, &notif);
     } else {
         resetBuffer(OS::threadId());
     }
@@ -653,6 +725,10 @@ Error PerfEvents::check(Arguments& args) {
         return Error("Only arguments 1-4 can be counted");
     }
 
+    if (_pthread_entry == NULL && (_pthread_entry = lookupThreadEntry()) == NULL) {
+        return Error("Could not set pthread hook");
+    }
+
     struct perf_event_attr attr = {0};
     attr.size = sizeof(attr);
     attr.type = event_type->type;
@@ -676,6 +752,10 @@ Error PerfEvents::check(Arguments& args) {
     } else if (!Symbols::haveKernelSymbols()) {
         Profiler::instance()->updateSymbols(true);
         attr.exclude_kernel = Symbols::haveKernelSymbols() ? 0 : 1;
+    }
+
+    if (_cstack == CSTACK_DWARF) {
+        attr.exclude_callchain_user = 1;
     }
 
 #ifdef PERF_ATTR_SIZE_VER5
@@ -704,6 +784,10 @@ Error PerfEvents::start(Arguments& args) {
         return Error("Only arguments 1-4 can be counted");
     }
 
+    if (_pthread_entry == NULL && (_pthread_entry = lookupThreadEntry()) == NULL) {
+        return Error("Could not set pthread hook");
+    }
+
     if (args._interval < 0) {
         return Error("interval must be positive");
     }
@@ -725,10 +809,18 @@ Error PerfEvents::start(Arguments& args) {
         _max_events = max_events;
     }
 
-    OS::installSignalHandler(SIGPROF, signalHandler);
+    if (VM::isOpenJ9()) {
+        OS::installSignalHandler(SIGPROF, signalHandlerJ9);
+        Error error = J9StackTraces::start(args);
+        if (error) {
+            return error;
+        }
+    } else {
+        OS::installSignalHandler(SIGPROF, signalHandler);
+    }
 
-    // Enable thread events before traversing currently running threads
-    Profiler::instance()->switchThreadEvents(JVMTI_ENABLE);
+    // Enable pthread hook before traversing currently running threads
+    __atomic_store_n(_pthread_entry, (void*)pthread_setspecific_hook, __ATOMIC_RELEASE);
 
     // Create perf_events for all existing threads
     int err;
@@ -742,9 +834,10 @@ Error PerfEvents::start(Arguments& args) {
     delete thread_list;
 
     if (!created) {
-        Profiler::instance()->switchThreadEvents(JVMTI_DISABLE);
+        __atomic_store_n(_pthread_entry, (void*)pthread_setspecific, __ATOMIC_RELEASE);
+        J9StackTraces::stop();
         if (err == EACCES || err == EPERM) {
-            return Error("No access to perf events. Try --all-user option or 'sysctl kernel.perf_event_paranoid=1'");
+            return Error("No access to perf events. Try --fdtransfer or --all-user option or 'sysctl kernel.perf_event_paranoid=1'");
         } else {
             return Error("Perf events unavailable");
         }
@@ -753,13 +846,14 @@ Error PerfEvents::start(Arguments& args) {
 }
 
 void PerfEvents::stop() {
+    __atomic_store_n(_pthread_entry, (void*)pthread_setspecific, __ATOMIC_RELEASE);
     for (int i = 0; i < _max_events; i++) {
         destroyForThread(i);
     }
+    J9StackTraces::stop();
 }
 
-int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, int max_depth,
-                               CodeCache* java_methods, CodeCache* runtime_stubs) {
+int PerfEvents::walk(int tid, const void** callchain, int max_depth) {
     PerfEvent* event = &_events[tid];
     if (!event->tryLock()) {
         return 0;  // the event is being destroyed
@@ -783,7 +877,7 @@ int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, 
                     u64 ip = ring.next();
                     if (ip < PERF_CONTEXT_MAX) {
                         const void* iptr = (const void*)ip;
-                        if (java_methods->contains(iptr) || runtime_stubs->contains(iptr) || depth >= max_depth) {
+                        if (CodeHeap::contains(iptr) || depth >= max_depth) {
                             // Stop at the first Java frame
                             goto stack_complete;
                         }
@@ -796,7 +890,7 @@ int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, 
 
                     // Last userspace PC is stored right after branch stack
                     const void* pc = (const void*)ring.peek(bnr * 3 + 2);
-                    if (java_methods->contains(pc) || runtime_stubs->contains(pc) || depth >= max_depth) {
+                    if (CodeHeap::contains(pc) || depth >= max_depth) {
                         goto stack_complete;
                     }
                     callchain[depth++] = pc;
@@ -806,12 +900,12 @@ int PerfEvents::getNativeTrace(void* ucontext, int tid, const void** callchain, 
                         const void* to = (const void*)ring.next();
                         ring.next();
 
-                        if (java_methods->contains(to) || runtime_stubs->contains(to) || depth >= max_depth) {
+                        if (CodeHeap::contains(to) || depth >= max_depth) {
                             goto stack_complete;
                         }
                         callchain[depth++] = to;
 
-                        if (java_methods->contains(from) || runtime_stubs->contains(from) || depth >= max_depth) {
+                        if (CodeHeap::contains(from) || depth >= max_depth) {
                             goto stack_complete;
                         }
                         callchain[depth++] = from;

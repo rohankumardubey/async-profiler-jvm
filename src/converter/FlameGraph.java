@@ -107,13 +107,15 @@ public class FlameGraph {
     }
 
     public void dump(PrintStream out) {
+        mintotal = (long) (root.total * minwidth / 100);
+        int depth = mintotal > 1 ? root.depth(mintotal) : this.depth + 1;
+
         out.print(applyReplacements(HEADER,
                 "{title}", title,
-                "{height}", (depth + 1) * 16,
-                "{depth}", depth + 1,
+                "{height}", Math.min(depth * 16, 32767),
+                "{depth}", depth,
                 "{reverse}", reverse));
 
-        mintotal = (long) (root.total * minwidth / 100);
         printFrame(out, "all", root, 0, 0);
 
         out.print(FOOTER);
@@ -143,6 +145,9 @@ public class FlameGraph {
     private void printFrame(PrintStream out, String title, Frame frame, int level, long x) {
         int type = frameType(title);
         title = stripSuffix(title);
+        if (title.indexOf('\\') >= 0) {
+            title = title.replace("\\", "\\\\");
+        }
         if (title.indexOf('\'') >= 0) {
             title = title.replace("'", "\\'");
         }
@@ -169,18 +174,18 @@ public class FlameGraph {
 
     private int frameType(String title) {
         if (title.endsWith("_[j]")) {
-            return 0;
-        } else if (title.endsWith("_[i]")) {
             return 1;
-        } else if (title.endsWith("_[k]")) {
+        } else if (title.endsWith("_[i]")) {
             return 2;
+        } else if (title.endsWith("_[k]")) {
+            return 5;
         } else if (title.contains("::") || title.startsWith("-[") || title.startsWith("+[")) {
-            return 3;
+            return 4;
         } else if (title.indexOf('/') > 0 && title.charAt(0) != '['
                 || title.indexOf('.') > 0 && Character.isUpperCase(title.charAt(0))) {
             return 0;
         } else {
-            return 4;
+            return 3;
         }
     }
 
@@ -211,6 +216,18 @@ public class FlameGraph {
                 put(title, child = new Frame());
             }
             return child;
+        }
+
+        int depth(long cutoff) {
+            int depth = 0;
+            if (size() > 0) {
+                for (Frame child : values()) {
+                    if (child.total >= cutoff) {
+                        depth = Math.max(depth, child.depth(cutoff));
+                    }
+                }
+            }
+            return depth + 1;
         }
     }
 
@@ -265,11 +282,12 @@ public class FlameGraph {
             "\tc.font = document.body.style.font;\n" +
             "\n" +
             "\tconst palette = [\n" +
+            "\t\t[0xa6e1a6, 20, 20, 20],\n" +
             "\t\t[0x50e150, 30, 30, 30],\n" +
-            "\t\t[0x50bebe, 30, 30, 30],\n" +
-            "\t\t[0xe17d00, 30, 30,  0],\n" +
-            "\t\t[0xc8c83c, 30, 30, 10],\n" +
+            "\t\t[0x50cccc, 30, 30, 30],\n" +
             "\t\t[0xe15a5a, 30, 40, 40],\n" +
+            "\t\t[0xc8c83c, 30, 30, 10],\n" +
+            "\t\t[0xe17d00, 30, 30,  0],\n" +
             "\t];\n" +
             "\n" +
             "\tfunction getColor(p) {\n" +
@@ -344,12 +362,12 @@ public class FlameGraph {
             "\t\tfunction totalMarked() {\n" +
             "\t\t\tlet total = 0;\n" +
             "\t\t\tlet left = 0;\n" +
-            "\t\t\tfor (let x in marked) {\n" +
+            "\t\t\tObject.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {\n" +
             "\t\t\t\tif (+x >= left) {\n" +
             "\t\t\t\t\ttotal += marked[x];\n" +
             "\t\t\t\t\tleft = +x + marked[x];\n" +
             "\t\t\t\t}\n" +
-            "\t\t\t}\n" +
+            "\t\t\t});\n" +
             "\t\t\treturn total;\n" +
             "\t\t}\n" +
             "\n" +

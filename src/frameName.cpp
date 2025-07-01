@@ -23,6 +23,11 @@
 #include "vmStructs.h"
 
 
+static inline bool isDigit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+
 Matcher::Matcher(const char* pattern) {
     if (pattern[0] == '*') {
         _type = MATCH_ENDS_WITH;
@@ -112,17 +117,40 @@ char* FrameName::truncate(char* name, int max_length) {
     return name;
 }
 
-const char* FrameName::cppDemangle(const char* name) {
-    if (name != NULL && name[0] == '_' && name[1] == 'Z') {
+const char* FrameName::decodeNativeSymbol(const char* name) {
+    const char* lib_name = (_style & STYLE_LIB_NAMES) ? Profiler::instance()->getLibraryName(name) : NULL;
+
+    if (name[0] == '_' && name[1] == 'Z') {
         int status;
         char* demangled = abi::__cxa_demangle(name, NULL, NULL, &status);
         if (demangled != NULL) {
-            strncpy(_buf, demangled, sizeof(_buf) - 1);
+            if (lib_name != NULL) {
+                snprintf(_buf, sizeof(_buf) - 1, "%s`%s", lib_name, demangled);
+            } else {
+                strncpy(_buf, demangled, sizeof(_buf) - 1);
+            }
             free(demangled);
             return _buf;
         }
     }
-    return name;
+
+    if (lib_name != NULL) {
+        snprintf(_buf, sizeof(_buf) - 1, "%s`%s", lib_name, name);
+        return _buf;
+    } else {
+        return name;
+    }
+}
+
+const char* FrameName::typeSuffix(int bci) {
+    switch (bci >> 24) {
+        case FRAME_JIT_COMPILED:
+            return "_[j]";
+        case FRAME_INLINED:
+            return "_[i]";
+        default:
+            return _style & STYLE_ANNOTATE ? "_[j]" : "";
+    }
 }
 
 char* FrameName::javaMethodName(jmethodID method) {
@@ -143,7 +171,6 @@ char* FrameName::javaMethodName(jmethodID method) {
         strcat(result, ".");
         strcat(result, method_name);
         if (_style & STYLE_SIGNATURES) strcat(result, truncate(method_sig, 255));
-        if (_style & STYLE_ANNOTATE) strcat(result, "_[j]");
     } else {
         snprintf(_buf, sizeof(_buf) - 1, "[jvmtiError %d]", err);
         result = _buf;
@@ -191,13 +218,13 @@ char* FrameName::javaClassName(const char* symbol, int length, int style) {
 
     if (style & STYLE_SIMPLE) {
         for (char* s = result; *s; s++) {
-            if (*s == '/') result = s + 1;
+            if (*s == '/' && !isDigit(s[1])) result = s + 1;
         }
     }
 
     if (style & STYLE_DOTTED) {
         for (char* s = result; *s; s++) {
-            if (*s == '/') *s = '.';
+            if (*s == '/' && !isDigit(s[1])) *s = '.';
         }
     }
 
@@ -211,7 +238,7 @@ const char* FrameName::name(ASGCT_CallFrame& frame, bool for_matching) {
 
     switch (frame.bci) {
         case BCI_NATIVE_FRAME:
-            return cppDemangle((const char*)frame.method_id);
+            return decodeNativeSymbol((const char*)frame.method_id);
 
         case BCI_ALLOC:
         case BCI_ALLOC_OUTSIDE_TLAB:
@@ -245,14 +272,20 @@ const char* FrameName::name(ASGCT_CallFrame& frame, bool for_matching) {
         }
 
         default: {
+            const char* type_suffix = typeSuffix(frame.bci);
+
             JMethodCache::iterator it = _cache.lower_bound(frame.method_id);
             if (it != _cache.end() && it->first == frame.method_id) {
+                if (type_suffix[0]) {
+                    snprintf(_buf, sizeof(_buf) - 1, "%s%s", it->second.c_str(), type_suffix);
+                    return _buf;
+                }
                 return it->second.c_str();
             }
 
-            const char* newName = javaMethodName(frame.method_id);
+            char* newName = javaMethodName(frame.method_id);
             _cache.insert(it, JMethodCache::value_type(frame.method_id, newName));
-            return newName;
+            return type_suffix[0] ? strcat(newName, type_suffix) : newName;
         }
     }
 }

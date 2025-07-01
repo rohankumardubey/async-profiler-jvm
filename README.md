@@ -18,16 +18,13 @@ to learn about all features.
 
 ## Download
 
-Current release (2.0):
+Current release (2.6):
 
- - Linux x64 (glibc): [async-profiler-2.0-linux-x64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/async-profiler-2.0-linux-x64.tar.gz)
- - Linux x86 (glibc): [async-profiler-2.0-linux-x86.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/async-profiler-2.0-linux-x86.tar.gz)
- - Linux x64 (musl): [async-profiler-2.0-linux-musl-x64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/async-profiler-2.0-linux-musl-x64.tar.gz)
- - Linux ARM: [async-profiler-2.0-linux-arm.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/async-profiler-2.0-linux-arm.tar.gz)
- - Linux AArch64: [async-profiler-2.0-linux-aarch64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/async-profiler-2.0-linux-aarch64.tar.gz)
- - macOS x64: [async-profiler-2.0-macos-x64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/async-profiler-2.0-macos-x64.tar.gz)
-   &nbsp;
- - Converters between profile formats: [converter.jar](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.0/converter.jar)  
+ - Linux x64 (glibc): [async-profiler-2.6-linux-x64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.6/async-profiler-2.6-linux-x64.tar.gz)
+ - Linux x64 (musl): [async-profiler-2.6-linux-musl-x64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.6/async-profiler-2.6-linux-musl-x64.tar.gz)
+ - Linux arm64: [async-profiler-2.6-linux-arm64.tar.gz](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.6/async-profiler-2.6-linux-arm64.tar.gz)
+ - macOS x64/arm64: [async-profiler-2.6-macos.zip](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.6/async-profiler-2.6-macos.zip)
+ - Converters between profile formats: [converter.jar](https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.6/converter.jar)  
    (JFR to Flame Graph, JFR to FlameScope, collapsed stacks to Flame Graph)
 
 [Previous releases](https://github.com/jvm-profiling-tools/async-profiler/releases)
@@ -37,8 +34,8 @@ For more information refer to [IntelliJ IDEA documentation](https://www.jetbrain
 
 ## Supported platforms
 
- - **Linux** / x64 / x86 / ARM / AArch64
- - **macOS** / x64 / AArch64 (Apple M1)
+ - **Linux** / x64 / x86 / arm64 / arm32 / ppc64le
+ - **macOS** / x64 / arm64
 
 ### Community supported builds
 
@@ -154,6 +151,7 @@ where `getProperty` method is called from.
 Only non-native Java methods are supported. To profile a native method,
 use hardware breakpoint event instead, e.g. `-e Java_java_lang_Throwable_fillInStackTrace`
 
+
 ## Finding native memory leaks
 
 A new experimental feature of async-profiler is to trace native memory allocations.
@@ -191,7 +189,7 @@ allocation samples will be limited to at most one sample per allocated megabyte.
 
 ## Building
 
-Build status: [![Build Status](https://travis-ci.org/jvm-profiling-tools/async-profiler.svg?branch=master)](https://travis-ci.org/jvm-profiling-tools/async-profiler)
+Build status: [![Build Status](https://github.com/jvm-profiling-tools/async-profiler/actions/workflows/cpp.yml/badge.svg?branch=master)](https://github.com/jvm-profiling-tools/async-profiler/actions/workflows/cpp.yml)
 
 Make sure the `JAVA_HOME` environment variable points to your JDK installation,
 and then run `make`. GCC is required. After building, the profiler agent binary
@@ -277,7 +275,7 @@ $ java -agentpath:/path/to/libasyncProfiler.so=start,event=cpu,file=profile.html
 
 Agent library is configured through the JVMTI argument interface.
 The format of the arguments string is described
-[in the source code](https://github.com/jvm-profiling-tools/async-profiler/blob/v2.0/src/arguments.cpp#L44).
+[in the source code](https://github.com/jvm-profiling-tools/async-profiler/blob/v2.6/src/arguments.cpp#L50).
 The `profiler.sh` script actually converts command line arguments to that format.
 
 For instance, `-e wall` is converted to `event=wall`, `-f profile.html`
@@ -404,6 +402,8 @@ The following is a complete list of the command-line options accepted by
 
 * `-a` - annotate Java method names by adding `_[j]` suffix.
 
+* `-l` - prepend library names to symbols, e.g. ``libjvm.so`JVM_DefineClassWithSource``.
+
 * `-o fmt` - specifies what information to dump when profiling ends.
   `fmt` can be one of the following options:
     - `traces[=N]` - dump call traces (at most N samples);
@@ -437,16 +437,25 @@ The following is a complete list of the command-line options accepted by
 
 * `-f FILENAME` - the file name to dump the profile information to.  
   `%p` in the file name is expanded to the PID of the target JVM;  
-  `%t` - to the timestamp at the time of command invocation.  
+  `%t` - to the timestamp;  
+  `%{ENV}` - to the value of the given environment variable.  
   Example: `./profiler.sh -o collapsed -f /tmp/traces-%t.txt 8983`
+
+* `--loop TIME` - run profiler in a loop (continuous profiling).
+  The argument is either a clock time (`hh:mm:ss`) or
+  a loop duration in `s`econds, `m`inutes, `h`ours, or `d`ays.
+  Make sure the filename includes a timestamp pattern, or the output
+  will be overwritten on each iteration.  
+  Example: `./profiler.sh --loop 1h -f /var/log/profile-%t.jfr 8983`
 
 * `--all-user` - include only user-mode events. This option is helpful when kernel profiling
   is restricted by `perf_event_paranoid` settings.  
 
 * `--sched` - group threads by Linux-specific scheduling policy: BATCH/IDLE/OTHER.
 
-* `--cstack MODE` - how to traverse native frames (C stack). Possible modes are
-  `fp` (Frame Pointer), `lbr` (Last Branch Record, available on Haswell since Linux 4.1),
+* `--cstack MODE` - how to walk native frames (C stack). Possible modes are
+  `fp` (Frame Pointer), `dwarf` (DWARF unwind info),
+  `lbr` (Last Branch Record, available on Haswell since Linux 4.1),
   and `no` (do not collect C stack).
 
   By default, C stack is shown in cpu, itimer, wall-clock and perf-events profiles.
@@ -461,6 +470,19 @@ The following is a complete list of the command-line options accepted by
   you choose (e.g. `cpu` or `wall`), the profiler will work as usual, except that
   only events between the safepoint request and the start of the VM operation
   will be recorded.
+
+* `--jfrsync CONFIG` - start Java Flight Recording with the given configuration
+  synchronously with the profiler. The output .jfr file will include all regular
+  JFR events, except that execution samples will be obtained from async-profiler.
+  This option implies `-o jfr`.
+    - `CONFIG` is a predefined JFR profile or a JFR configuration file (.jfc).
+
+  Example: `./profiler.sh -e cpu --jfrsync profile -f combined.jfr 8983`
+
+* `--fdtransfer` - runs "fdtransfer" alongside, which is a small program providing an interface
+  for the profiler to access, `perf_event_open` even while this syscall is unavailable for the
+  profiled process (due to low privileges).
+  See [Profiling Java in a container](#profiling-java-in-a-container).
 
 * `-v`, `--version` - prints the version of profiler library. If PID is specified,
   gets the version of the library loaded into the given process.
@@ -481,13 +503,12 @@ the target container can access `libasyncProfiler.so` by the same
 absolute path as on the host.
 
 By default, Docker container restricts the access to `perf_event_open`
-syscall. So, in order to allow profiling inside a container, you'll need
-to modify [seccomp profile](https://docs.docker.com/engine/security/seccomp/)
+syscall. There are 3 alternatives to allow profiling in a container:
+1. You can modify the [seccomp profile](https://docs.docker.com/engine/security/seccomp/)
 or disable it altogether with `--security-opt seccomp=unconfined` option. In
 addition, `--cap-add SYS_ADMIN` may be required.
-
-Alternatively, if changing Docker configuration is not possible,
-you may fall back to `-e itimer` profiling mode, see [Troubleshooting](#troubleshooting).
+2. You can use "fdtransfer": see the help for `--fdtransfer`.
+3. Last, you may fall back to `-e itimer` profiling mode, see [Troubleshooting](#troubleshooting).
 
 ## Restrictions/Limitations
 
@@ -572,7 +593,7 @@ Make sure the user of JVM process has permissions to access `libasyncProfiler.so
 For more information see [#78](https://github.com/jvm-profiling-tools/async-profiler/issues/78).
 
 ```
-No access to perf events. Try --all-user option or 'sysctl kernel.perf_event_paranoid=1'
+No access to perf events. Try --fdtransfer or --all-user option or 'sysctl kernel.perf_event_paranoid=1'
 ```
 or
 ```
@@ -582,9 +603,12 @@ Perf events unavailable
 
 Typical reasons include:
 1. `/proc/sys/kernel/perf_event_paranoid` is set to restricted mode (>=2).
-2. seccomp disables perf_event_open API in a container.
+2. seccomp disables `perf_event_open` API in a container.
 3. OS runs under a hypervisor that does not virtualize performance counters.
 4. perf_event_open API is not supported on this system, e.g. WSL.
+
+For permissions-related reasons (such as 1 and 2), using `--fdtransfer` while running the profiler
+as a privileged user will allow using perf_events.
 
 If changing the configuration is not possible, you may fall back to
 `-e itimer` profiling mode. It is similar to `cpu` mode, but does not

@@ -23,14 +23,45 @@
 #define NO_MIN_ADDRESS  ((const void*)-1)
 #define NO_MAX_ADDRESS  ((const void*)0)
 
+typedef bool (*NamePredicate)(const char* name);
+
 const int INITIAL_CODE_CACHE_CAPACITY = 1000;
+
+
+class NativeFunc {
+  private:
+    short _lib_index;
+    char _mark;
+    char _reserved;
+    char _name[0];
+
+    static NativeFunc* from(const char* name) {
+        return (NativeFunc*)(name - sizeof(NativeFunc));
+    }
+
+  public:
+    static char* create(const char* name, short lib_index);
+    static void destroy(char* name);
+
+    static short libIndex(const char* name) {
+        return from(name)->_lib_index;
+    }
+
+    static bool isMarked(const char* name) {
+        return from(name)->_mark != 0;
+    }
+
+    static void mark(const char* name) {
+        from(name)->_mark = 1;
+    }
+};
 
 
 class CodeBlob {
   public:
     const void* _start;
     const void* _end;
-    jmethodID _method;
+    char* _name;
 
     static int comparator(const void* c1, const void* c2) {
         CodeBlob* cb1 = (CodeBlob*)c1;
@@ -48,73 +79,84 @@ class CodeBlob {
 };
 
 
+class FrameDesc;
+
 class CodeCache {
   protected:
+    char* _name;
+    short _lib_index;
+    const void* _min_address;
+    const void* _max_address;
+    const char* _text_base;
+
+    const void** _got_start;
+    const void** _got_end;
+
+    FrameDesc* _dwarf_table;
+    int _dwarf_table_length;
+
     int _capacity;
     int _count;
     CodeBlob* _blobs;
-    const void* _min_address;
-    const void* _max_address;
 
     void expand();
 
   public:
-    CodeCache() {
-        _capacity = INITIAL_CODE_CACHE_CAPACITY;
-        _count = 0;
-        _blobs = new CodeBlob[_capacity];
-        _min_address = NO_MIN_ADDRESS;
-        _max_address = NO_MAX_ADDRESS;
-    }
+    CodeCache(const char* name,
+              short lib_index = -1,
+              const void* min_address = NO_MIN_ADDRESS,
+              const void* max_address = NO_MAX_ADDRESS);
 
-    ~CodeCache() {
-        delete[] _blobs;
-    }
+    ~CodeCache();
 
-    void reset() {
-        _count = 0;
-    }
-
-    bool contains(const void* address) {
-        return address >= _min_address && address < _max_address;
-    }
-
-    void add(const void* start, int length, jmethodID method, bool update_bounds = false);
-    void remove(const void* start, jmethodID method);
-    void updateBounds(const void* start, const void* end);
-    jmethodID find(const void* address);
-};
-
-
-class NativeCodeCache : public CodeCache {
-  private:
-    char* _name;
-
-  public:
-    NativeCodeCache(const char* name,
-                    const void* min_address = NO_MIN_ADDRESS,
-                    const void* max_address = NO_MAX_ADDRESS);
-
-    ~NativeCodeCache();
-
-    const char* name() {
+    const char* name() const {
         return _name;
     }
 
-    const void* minAddress() {
+    const void* minAddress() const {
         return _min_address;
     }
 
-    const void* maxAddress() {
+    const void* maxAddress() const {
         return _max_address;
     }
 
+    bool contains(const void* address) const {
+        return address >= _min_address && address < _max_address;
+    }
+
+    const char* textBase() const {
+        return _text_base;
+    }
+
+    void setTextBase(const char* text_base) {
+        _text_base = text_base;
+    }
+
+    const void** gotStart() const {
+        return _got_start;
+    }
+
+    const void** gotEnd() const {
+        return _got_end;
+    }
+
     void add(const void* start, int length, const char* name, bool update_bounds = false);
+    void updateBounds(const void* start, const void* end);
     void sort();
+    void mark(NamePredicate predicate);
+
+    const char* find(const void* address);
     const char* binarySearch(const void* address);
     const void* findSymbol(const char* name);
     const void* findSymbolByPrefix(const char* prefix);
     const void* findSymbolByPrefix(const char* prefix, int prefix_len);
+
+    void setGlobalOffsetTable(const void* start, unsigned int size);
+    const void** findGlobalOffsetEntry(const void* address);
+
+    void setDwarfTable(FrameDesc* table, int length);
+    FrameDesc* findFrameDesc(const void* pc);
 };
 
 #endif // _CODECACHE_H

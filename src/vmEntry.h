@@ -20,11 +20,21 @@
 #include <jvmti.h>
 
 
-#if __GNUC__ == 4
-#  undef JNIEXPORT
-#  define JNIEXPORT __attribute__((visibility("default")))
+#ifdef __clang__
+#  define DLLEXPORT __attribute__((visibility("default")))
+#else
+#  define DLLEXPORT __attribute__((externally_visible))
 #endif
 
+
+enum FrameTypeId {
+    FRAME_INTERPRETED  = 0,
+    FRAME_JIT_COMPILED = 1,
+    FRAME_INLINED      = 2,
+    FRAME_NATIVE       = 3,
+    FRAME_CPP          = 4,
+    FRAME_KERNEL       = 5,
+};
 
 // Denotes ASGCT_CallFrame where method_id has special meaning (not jmethodID)
 enum ASGCT_CallFrameType {
@@ -79,9 +89,7 @@ typedef VMManagement* (*JVM_GetManagement)(jint);
 typedef struct {
     void* unused1[86];
     jvmtiError (JNICALL *RedefineClasses)(jvmtiEnv*, jint, const jvmtiClassDefinition*);
-    void* unused2[35];
-    jvmtiError (JNICALL *GenerateEvents)(jvmtiEnv*, jvmtiEvent);
-    void* unused3[28];
+    void* unused2[64];
     jvmtiError (JNICALL *RetransformClasses)(jvmtiEnv*, jint, const jclass*);
 } JVMTIFunctions;
 
@@ -90,12 +98,12 @@ class VM {
   private:
     static JavaVM* _vm;
     static jvmtiEnv* _jvmti;
-    static JVM_GetManagement _getManagement;
+
+    static int _hotspot_version;
+    static bool _openj9;
+
     static jvmtiError (JNICALL *_orig_RedefineClasses)(jvmtiEnv*, jint, const jvmtiClassDefinition*);
     static jvmtiError (JNICALL *_orig_RetransformClasses)(jvmtiEnv*, jint, const jclass* classes);
-    static jvmtiError (JNICALL *_orig_GenerateEvents)(jvmtiEnv* jvmti, jvmtiEvent event_type);
-    static volatile int _in_redefine_classes;
-    static int _hotspot_version;
 
     static void ready();
     static void* getLibraryHandle(const char* name);
@@ -106,8 +114,11 @@ class VM {
     static void* _libjvm;
     static void* _libjava;
     static AsyncGetCallTrace _asyncGetCallTrace;
+    static JVM_GetManagement _getManagement;
 
     static bool init(JavaVM* vm, bool attach);
+
+    static void restartProfiler();
 
     static jvmtiEnv* jvmti() {
         return _jvmti;
@@ -121,7 +132,7 @@ class VM {
     static JNIEnv* attachThread(const char* name) {
         JNIEnv* jni;
         JavaVMAttachArgs args = {JNI_VERSION_1_6, (char*)name, NULL};
-        return _vm->AttachCurrentThread((void**)&jni, &args) == 0 ? jni : NULL;
+        return _vm->AttachCurrentThreadAsDaemon((void**)&jni, &args) == 0 ? jni : NULL;
     }
 
     static void detachThread() {
@@ -136,8 +147,8 @@ class VM {
         return _hotspot_version;
     }
 
-    static bool inRedefineClasses() {
-        return _in_redefine_classes > 0;
+    static bool isOpenJ9() {
+        return _openj9;
     }
 
     static void JNICALL VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread);
@@ -153,7 +164,6 @@ class VM {
 
     static jvmtiError JNICALL RedefineClassesHook(jvmtiEnv* jvmti, jint class_count, const jvmtiClassDefinition* class_definitions);
     static jvmtiError JNICALL RetransformClassesHook(jvmtiEnv* jvmti, jint class_count, const jclass* classes);
-    static jvmtiError JNICALL GenerateEventsHook(jvmtiEnv* jvmti, jvmtiEvent event_type);
 };
 
 #endif // _VMENTRY_H

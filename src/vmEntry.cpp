@@ -19,12 +19,14 @@
 #include <string.h>
 #include "vmEntry.h"
 #include "arguments.h"
+#include "j9Ext.h"
 #include "javaApi.h"
 #include "os.h"
 #include "profiler.h"
 #include "instrument.h"
 #include "lockTracer.h"
 #include "log.h"
+#include "objectSampler.h"
 #include "vmStructs.h"
 
 
@@ -32,23 +34,47 @@
 const int ARGUMENTS_ERROR = 100;
 const int COMMAND_ERROR = 200;
 
-static Arguments _agent_args;
+static Arguments _agent_args(true);
 
 JavaVM* VM::_vm;
 jvmtiEnv* VM::_jvmti = NULL;
+
 int VM::_hotspot_version = 0;
+bool VM::_openj9 = false;
+
+jvmtiError (JNICALL *VM::_orig_RedefineClasses)(jvmtiEnv*, jint, const jvmtiClassDefinition*);
+jvmtiError (JNICALL *VM::_orig_RetransformClasses)(jvmtiEnv*, jint, const jclass* classes);
+
 void* VM::_libjvm;
 void* VM::_libjava;
 AsyncGetCallTrace VM::_asyncGetCallTrace;
 JVM_GetManagement VM::_getManagement;
-jvmtiError (JNICALL *VM::_orig_RedefineClasses)(jvmtiEnv*, jint, const jvmtiClassDefinition*);
-jvmtiError (JNICALL *VM::_orig_RetransformClasses)(jvmtiEnv*, jint, const jclass* classes);
-jvmtiError (JNICALL *VM::_orig_GenerateEvents)(jvmtiEnv* jvmti, jvmtiEvent event_type);
-volatile int VM::_in_redefine_classes = 0;
 
 
 static void wakeupHandler(int signo) {
     // Dummy handler for interrupting syscalls
+}
+
+static bool isZeroInterpreterMethod(const char* blob_name) {
+    return strncmp(blob_name, "_ZN15ZeroInterpreter", 20) == 0
+        || strncmp(blob_name, "_ZN19BytecodeInterpreter3run", 28) == 0;
+}
+
+static bool isOpenJ9InterpreterMethod(const char* blob_name) {
+    return strncmp(blob_name, "_ZN32VM_BytecodeInterpreter", 27) == 0
+        || strncmp(blob_name, "_ZN26VM_BytecodeInterpreter", 27) == 0
+        || strncmp(blob_name, "bytecodeLoop", 12) == 0
+        || strcmp(blob_name, "cInterpreter") == 0;
+}
+
+static bool isOpenJ9JitStub(const char* blob_name) {
+    if (strncmp(blob_name, "jit", 3) == 0) {
+        blob_name += 3;
+        return strcmp(blob_name, "NewObject") == 0
+            || strcmp(blob_name, "NewArray") == 0
+            || strcmp(blob_name, "ANewArray") == 0;
+    }
+    return false;
 }
 
 
@@ -60,30 +86,66 @@ bool VM::init(JavaVM* vm, bool attach) {
         return false;
     }
 
+#ifdef __APPLE__
+    Dl_info dl_info;
+    if (dladdr((const void*)wakeupHandler, &dl_info) && dl_info.dli_fname != NULL) {
+        // Make sure async-profiler DSO cannot be unloaded, since it contains JVM callbacks.
+        // On Linux, we use 'nodelete' linker option.
+        dlopen(dl_info.dli_fname, RTLD_LAZY | RTLD_NODELETE);
+    }
+#endif
+
+    bool is_hotspot = false;
+    bool is_zero_vm = false;
     char* prop;
     if (_jvmti->GetSystemProperty("java.vm.name", &prop) == 0) {
-        bool is_hotspot = strstr(prop, "OpenJDK") != NULL ||
-                          strstr(prop, "HotSpot") != NULL ||
-                          strstr(prop, "GraalVM") != NULL;
+        is_hotspot = strstr(prop, "OpenJDK") != NULL ||
+                     strstr(prop, "HotSpot") != NULL ||
+                     strstr(prop, "GraalVM") != NULL ||
+                     strstr(prop, "Dynamic Code Evolution") != NULL;
+        is_zero_vm = strstr(prop, "Zero") != NULL;
         _jvmti->Deallocate((unsigned char*)prop);
+    }
 
-        if (is_hotspot && _jvmti->GetSystemProperty("java.vm.version", &prop) == 0) {
-            if (strncmp(prop, "25.", 3) == 0) {
-                _hotspot_version = 8;
-            } else if (strncmp(prop, "24.", 3) == 0) {
-                _hotspot_version = 7;
-            } else if (strncmp(prop, "20.", 3) == 0) {
-                _hotspot_version = 6;
-            } else if ((_hotspot_version = atoi(prop)) < 9) {
-                _hotspot_version = 9;
-            }
-            _jvmti->Deallocate((unsigned char*)prop);
+    if (is_hotspot && _jvmti->GetSystemProperty("java.vm.version", &prop) == 0) {
+        if (strncmp(prop, "25.", 3) == 0) {
+            _hotspot_version = 8;
+        } else if (strncmp(prop, "24.", 3) == 0) {
+            _hotspot_version = 7;
+        } else if (strncmp(prop, "20.", 3) == 0) {
+            _hotspot_version = 6;
+        } else if ((_hotspot_version = atoi(prop)) < 9) {
+            _hotspot_version = 9;
         }
+        _jvmti->Deallocate((unsigned char*)prop);
     }
 
     _libjvm = getLibraryHandle("libjvm.so");
     _asyncGetCallTrace = (AsyncGetCallTrace)dlsym(_libjvm, "AsyncGetCallTrace");
     _getManagement = (JVM_GetManagement)dlsym(_libjvm, "JVM_GetManagement");
+
+    Profiler* profiler = Profiler::instance();
+    profiler->updateSymbols(false);
+
+    _openj9 = !is_hotspot && J9Ext::initialize(_jvmti, profiler->resolveSymbol("j9thread_self"));
+
+    CodeCache* lib = isOpenJ9()
+        ? profiler->findJvmLibrary("libj9vm")
+        : profiler->findNativeLibrary((const void*)_asyncGetCallTrace);
+    if (lib == NULL) {
+        return false;  // TODO: verify
+    }
+
+    VMStructs::init(lib);
+    if (is_zero_vm) {
+        lib->mark(isZeroInterpreterMethod);
+    } else if (isOpenJ9()) {
+        lib->mark(isOpenJ9InterpreterMethod);
+        CodeCache* libjit = profiler->findJvmLibrary("libj9jit");
+        if (libjit != NULL) {
+            libjit->mark(isOpenJ9JitStub);
+        }
+    }
 
     if (attach) {
         ready();
@@ -92,7 +154,8 @@ bool VM::init(JavaVM* vm, bool attach) {
     jvmtiCapabilities capabilities = {0};
     capabilities.can_generate_all_class_hook_events = 1;
     capabilities.can_retransform_classes = 1;
-    capabilities.can_retransform_any_class = 1;
+    capabilities.can_retransform_any_class = isOpenJ9() ? 0 : 1;
+    capabilities.can_generate_vm_object_alloc_events = isOpenJ9() ? 1 : 0;
     capabilities.can_get_bytecodes = 1;
     capabilities.can_get_constant_pool = 1;
     capabilities.can_get_source_file_name = 1;
@@ -109,34 +172,37 @@ bool VM::init(JavaVM* vm, bool attach) {
     callbacks.ClassPrepare = ClassPrepare;
     callbacks.ClassFileLoadHook = Instrument::ClassFileLoadHook;
     callbacks.CompiledMethodLoad = Profiler::CompiledMethodLoad;
-    callbacks.CompiledMethodUnload = Profiler::CompiledMethodUnload;
     callbacks.DynamicCodeGenerated = Profiler::DynamicCodeGenerated;
     callbacks.ThreadStart = Profiler::ThreadStart;
     callbacks.ThreadEnd = Profiler::ThreadEnd;
     callbacks.MonitorContendedEnter = LockTracer::MonitorContendedEnter;
     callbacks.MonitorContendedEntered = LockTracer::MonitorContendedEntered;
+    callbacks.VMObjectAlloc = ObjectSampler::VMObjectAlloc;
     _jvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
 
-    _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, NULL);
     _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_DEATH, NULL);
     _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_LOAD, NULL);
     _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, NULL);
-    _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_COMPILED_METHOD_LOAD, NULL);
-    _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_COMPILED_METHOD_UNLOAD, NULL);
     _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_DYNAMIC_CODE_GENERATED, NULL);
+
+    if (hotspot_version() == 0 || !CodeHeap::available()) {
+        // Workaround for JDK-8173361: avoid CompiledMethodLoad events when possible
+        _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_COMPILED_METHOD_LOAD, NULL);
+    } else {
+        // DebugNonSafepoints is automatically enabled with CompiledMethodLoad,
+        // otherwise we set the flag manually
+        char* flag_addr = (char*)JVMFlag::find("DebugNonSafepoints");
+        if (flag_addr != NULL) {
+            *flag_addr = 1;
+        }
+    }
 
     if (attach) {
         loadAllMethodIDs(jvmti(), jni());
-        DisableSweeper ds;
         _jvmti->GenerateEvents(JVMTI_EVENT_DYNAMIC_CODE_GENERATED);
         _jvmti->GenerateEvents(JVMTI_EVENT_COMPILED_METHOD_LOAD);
-    }
-
-    if (hotspot_version() > 0 && hotspot_version() < 11) {
-        // Avoid GenerateEvents conflict with another agent
-        JVMTIFunctions* functions = *(JVMTIFunctions**)_jvmti;
-        _orig_GenerateEvents = functions->GenerateEvents;
-        functions->GenerateEvents = GenerateEventsHook;
+    } else {
+        _jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, NULL);
     }
 
     OS::installSignalHandler(WAKEUP_SIGNAL, NULL, wakeupHandler);
@@ -146,15 +212,12 @@ bool VM::init(JavaVM* vm, bool attach) {
 
 // Run late initialization when JVM is ready
 void VM::ready() {
-    Profiler* profiler = Profiler::instance();
-    profiler->updateSymbols(false);
-    NativeCodeCache* libjvm = profiler->findNativeLibrary((const void*)_asyncGetCallTrace);
-    if (libjvm != NULL) {
-        JitWriteProtection jit(true);  // workaround for JDK-8262896
-        VMStructs::init(libjvm);
+    {
+        JitWriteProtection jit(true);
+        VMStructs::ready();
     }
 
-    profiler->setupTrapHandler();
+    Profiler::setupSignalHandlers();
 
     _libjava = getLibraryHandle("libjava.so");
 
@@ -211,6 +274,10 @@ void VM::loadAllMethodIDs(jvmtiEnv* jvmti, JNIEnv* jni) {
     }
 }
 
+void VM::restartProfiler() {
+    Profiler::instance()->restart(_agent_args);
+}
+
 void JNICALL VM::VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
     ready();
     loadAllMethodIDs(jvmti, jni);
@@ -218,7 +285,7 @@ void JNICALL VM::VMInit(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
     // Delayed start of profiler if agent has been loaded at VM bootstrap
     Error error = Profiler::instance()->run(_agent_args);
     if (error) {
-        Log::error(error.message());
+        Log::error("%s", error.message());
     }
 }
 
@@ -227,7 +294,6 @@ void JNICALL VM::VMDeath(jvmtiEnv* jvmti, JNIEnv* jni) {
 }
 
 jvmtiError VM::RedefineClassesHook(jvmtiEnv* jvmti, jint class_count, const jvmtiClassDefinition* class_definitions) {
-    atomicInc(_in_redefine_classes);
     jvmtiError result = _orig_RedefineClasses(jvmti, class_count, class_definitions);
 
     if (result == 0) {
@@ -240,12 +306,10 @@ jvmtiError VM::RedefineClassesHook(jvmtiEnv* jvmti, jint class_count, const jvmt
         }
     }
 
-    atomicInc(_in_redefine_classes, -1);
     return result;
 }
 
 jvmtiError VM::RetransformClassesHook(jvmtiEnv* jvmti, jint class_count, const jclass* classes) {
-    atomicInc(_in_redefine_classes);
     jvmtiError result = _orig_RetransformClasses(jvmti, class_count, classes);
 
     if (result == 0) {
@@ -258,26 +322,16 @@ jvmtiError VM::RetransformClassesHook(jvmtiEnv* jvmti, jint class_count, const j
         }
     }
 
-    atomicInc(_in_redefine_classes, -1);
     return result;
 }
 
-jvmtiError VM::GenerateEventsHook(jvmtiEnv* jvmti, jvmtiEvent event_type) {
-    if (event_type == JVMTI_EVENT_COMPILED_METHOD_LOAD) {
-        // Workaround for JDK-8222072: prepare to receive events designated for another agent
-        Log::warn("async-profiler conflicts with another agent calling GenerateEvents()");
-        Profiler::instance()->resetJavaMethods();
-    }
-    return _orig_GenerateEvents(jvmti, event_type);
-}
 
-
-extern "C" JNIEXPORT jint JNICALL
+extern "C" DLLEXPORT jint JNICALL
 Agent_OnLoad(JavaVM* vm, char* options, void* reserved) {
     Error error = _agent_args.parse(options);
     Log::open(_agent_args._log);
     if (error) {
-        Log::error(error.message());
+        Log::error("%s", error.message());
         return ARGUMENTS_ERROR;
     }
 
@@ -289,13 +343,13 @@ Agent_OnLoad(JavaVM* vm, char* options, void* reserved) {
     return 0;
 }
 
-extern "C" JNIEXPORT jint JNICALL
+extern "C" DLLEXPORT jint JNICALL
 Agent_OnAttach(JavaVM* vm, char* options, void* reserved) {
-    Arguments args;
+    Arguments args(true);
     Error error = args.parse(options);
     Log::open(args._log);
     if (error) {
-        Log::error(error.message());
+        Log::error("%s", error.message());
         return ARGUMENTS_ERROR;
     }
 
@@ -311,14 +365,14 @@ Agent_OnAttach(JavaVM* vm, char* options, void* reserved) {
 
     error = Profiler::instance()->run(args);
     if (error) {
-        Log::error(error.message());
+        Log::error("%s", error.message());
         return COMMAND_ERROR;
     }
 
     return 0;
 }
 
-extern "C" JNIEXPORT jint JNICALL
+extern "C" DLLEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     if (!VM::init(vm, true)) {
         return 0;
@@ -326,4 +380,12 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     JavaAPI::registerNatives(VM::jvmti(), VM::jni());
     return JNI_VERSION_1_6;
+}
+
+extern "C" DLLEXPORT void JNICALL
+JNI_OnUnload(JavaVM* vm, void* reserved) {
+    Profiler* profiler = Profiler::instance();
+    if (profiler != NULL) {
+        profiler->stop();
+    }
 }

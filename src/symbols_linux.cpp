@@ -27,12 +27,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/limits.h>
-#include <fstream>
-#include <iostream>
-#include <string>
 #include "symbols.h"
 #include "arch.h"
+#include "dwarf.h"
+#include "fdtransferClient.h"
 #include "log.h"
+#include "os.h"
 
 
 class SymbolDesc {
@@ -106,13 +106,13 @@ typedef Elf32_Rel  ElfRelocation;
 
 class ElfParser {
   private:
-    NativeCodeCache* _cc;
+    CodeCache* _cc;
     const char* _base;
     const char* _file_name;
     ElfHeader* _header;
     const char* _sections;
 
-    ElfParser(NativeCodeCache* cc, const char* base, const void* addr, const char* file_name = NULL) {
+    ElfParser(CodeCache* cc, const char* base, const void* addr, const char* file_name = NULL) {
         _cc = cc;
         _base = base;
         _file_name = file_name;
@@ -144,8 +144,8 @@ class ElfParser {
     void addRelocationSymbols(ElfSection* reltab, const char* plt);
 
   public:
-    static bool parseFile(NativeCodeCache* cc, const char* base, const char* file_name, bool use_debug);
-    static void parseMem(NativeCodeCache* cc, const char* base);
+    static bool parseFile(CodeCache* cc, const char* base, const char* file_name, bool use_debug);
+    static void parseMem(CodeCache* cc, const char* base);
 };
 
 
@@ -154,7 +154,7 @@ ElfSection* ElfParser::findSection(uint32_t type, const char* name) {
 
     for (int i = 0; i < _header->e_shnum; i++) {
         ElfSection* section = this->section(i);
-        if (section->sh_type == type && section->sh_name != 0) {
+        if ((type == 0 || section->sh_type == type) && section->sh_name != 0) {
             if (strcmp(strtab + section->sh_name, name) == 0) {
                 return section;
             }
@@ -164,7 +164,7 @@ ElfSection* ElfParser::findSection(uint32_t type, const char* name) {
     return NULL;
 }
 
-bool ElfParser::parseFile(NativeCodeCache* cc, const char* base, const char* file_name, bool use_debug) {
+bool ElfParser::parseFile(CodeCache* cc, const char* base, const char* file_name, bool use_debug) {
     int fd = open(file_name, O_RDONLY);
     if (fd == -1) {
         return false;
@@ -184,7 +184,7 @@ bool ElfParser::parseFile(NativeCodeCache* cc, const char* base, const char* fil
     return true;
 }
 
-void ElfParser::parseMem(NativeCodeCache* cc, const char* base) {
+void ElfParser::parseMem(CodeCache* cc, const char* base) {
     ElfParser elf(cc, base, base);
     elf.loadSymbols(false);
 }
@@ -215,8 +215,10 @@ void ElfParser::loadSymbols(bool use_debug) {
     }
 
 loaded:
-    // Synthesize names for PLT stubs
     if (use_debug) {
+        _cc->setTextBase(_base);
+
+        // Synthesize names for PLT stubs
         ElfSection* plt = findSection(SHT_PROGBITS, ".plt");
         ElfSection* reltab = findSection(SHT_RELA, ".rela.plt");
         if (reltab == NULL) {
@@ -224,6 +226,19 @@ loaded:
         }
         if (plt != NULL && reltab != NULL) {
             addRelocationSymbols(reltab, _base + plt->sh_offset + PLT_HEADER_SIZE);
+        }
+
+        // Find the bounds of the Global Offset Table
+        ElfSection* got = findSection(SHT_PROGBITS, ".got.plt");
+        if (got != NULL || (got = findSection(SHT_PROGBITS, ".got")) != NULL) {
+            _cc->setGlobalOffsetTable(_base + got->sh_addr, got->sh_size);
+        }
+
+        // Read DWARF unwind info
+        ElfSection* eh_frame_hdr = findSection(0, ".eh_frame_hdr");
+        if (eh_frame_hdr != NULL && DWARF_SUPPORTED) {
+            DwarfParser dwarf(_cc->name(), (const char*)_header, at(eh_frame_hdr));
+            _cc->setDwarfTable(dwarf.table(), dwarf.count());
         }
     }
 }
@@ -343,13 +358,32 @@ Mutex Symbols::_parse_lock;
 std::set<const void*> Symbols::_parsed_libraries;
 bool Symbols::_have_kernel_symbols = false;
 
-void Symbols::parseKernelSymbols(NativeCodeCache* cc) {
-    std::ifstream maps("/proc/kallsyms");
-    std::string str;
+void Symbols::parseKernelSymbols(CodeCache* cc) {
+    int fd;
+    if (FdTransferClient::hasPeer()) {
+        fd = FdTransferClient::requestKallsymsFd();
+    } else {
+        fd = open("/proc/kallsyms", O_RDONLY);
+    }
 
-    while (std::getline(maps, str)) {
-        str += "_[k]";
-        SymbolDesc symbol(str.c_str());
+    if (fd == -1) {
+        Log::warn("open(\"/proc/kallsyms\"): %s", strerror(errno));
+        return;
+    }
+
+    FILE* f = fdopen(fd, "r");
+    if (f == NULL) {
+        Log::warn("fdopen(): %s", strerror(errno));
+        close(fd);
+        return;
+    }
+
+    char str[256];
+    while (fgets(str, sizeof(str) - 8, f) != NULL) {
+        size_t len = strlen(str) - 1; // trim the '\n'
+        strcpy(str + len, "_[k]");
+
+        SymbolDesc symbol(str);
         char type = symbol.type();
         if (type == 'T' || type == 't' || type == 'W' || type == 'w') {
             const char* addr = symbol.addr();
@@ -359,13 +393,15 @@ void Symbols::parseKernelSymbols(NativeCodeCache* cc) {
             }
         }
     }
+
+    fclose(f);
 }
 
-void Symbols::parseLibraries(NativeCodeCache** array, volatile int& count, int size, bool kernel_symbols) {
+void Symbols::parseLibraries(CodeCache** array, volatile int& count, int size, bool kernel_symbols) {
     MutexLocker ml(_parse_lock);
 
     if (kernel_symbols && !haveKernelSymbols()) {
-        NativeCodeCache* cc = new NativeCodeCache("[kernel]");
+        CodeCache* cc = new CodeCache("[kernel]");
         parseKernelSymbols(cc);
 
         if (haveKernelSymbols()) {
@@ -377,18 +413,26 @@ void Symbols::parseLibraries(NativeCodeCache** array, volatile int& count, int s
         }
     }
 
-    std::ifstream maps("/proc/self/maps");
-    std::string str;
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (f == NULL) {
+        return;
+    }
 
-    while (count < size && std::getline(maps, str)) {
-        MemoryMapDesc map(str.c_str());
+    char* str = NULL;
+    size_t str_size = 0;
+    ssize_t len;
+
+    while (count < size && (len = getline(&str, &str_size, f)) > 0) {
+        str[len - 1] = 0;
+
+        MemoryMapDesc map(str);
         if (map.isExecutable() && map.file() != NULL && map.file()[0] != 0) {
             const char* image_base = map.addr();
             if (!_parsed_libraries.insert(image_base).second) {
                 continue;  // the library was already parsed
             }
 
-            NativeCodeCache* cc = new NativeCodeCache(map.file(), image_base, map.end());
+            CodeCache* cc = new CodeCache(map.file(), count, image_base, map.end());
 
             if (map.inode() != 0) {
                 ElfParser::parseFile(cc, image_base - map.offs(), map.file(), true);
@@ -401,6 +445,15 @@ void Symbols::parseLibraries(NativeCodeCache** array, volatile int& count, int s
             atomicInc(count);
         }
     }
+
+    free(str);
+    fclose(f);
+}
+
+void Symbols::makePatchable(CodeCache* cc) {
+    uintptr_t got_start = (uintptr_t)cc->gotStart() & ~OS::page_mask;
+    uintptr_t got_size = ((uintptr_t)cc->gotEnd() - got_start + OS::page_mask) & ~OS::page_mask;
+    mprotect((void*)got_start, got_size, PROT_READ | PROT_WRITE);
 }
 
 #endif // __linux__

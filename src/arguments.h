@@ -58,13 +58,15 @@ enum Style {
     STYLE_SIMPLE     = 1,
     STYLE_DOTTED     = 2,
     STYLE_SIGNATURES = 4,
-    STYLE_ANNOTATE   = 8
+    STYLE_ANNOTATE   = 8,
+    STYLE_LIB_NAMES  = 16
 };
 
 enum CStack {
     CSTACK_DEFAULT,
     CSTACK_NO,
     CSTACK_FP,
+    CSTACK_DWARF,
     CSTACK_LBR
 };
 
@@ -84,10 +86,7 @@ enum JfrOption {
     NO_NATIVE_LIBS  = 0x4,
     NO_CPU_LOAD     = 0x8,
 
-    JFR_SYNC        = 0x10,
-    JFR_TEMP_FILE   = 0x20,
-
-    JFR_COMBINE     = NO_SYSTEM_INFO | NO_SYSTEM_PROPS | NO_NATIVE_LIBS | NO_CPU_LOAD | JFR_SYNC | JFR_TEMP_FILE
+    JFR_SYNC_OPTS   = NO_SYSTEM_INFO | NO_SYSTEM_PROPS | NO_NATIVE_LIBS | NO_CPU_LOAD
 };
 
 
@@ -121,6 +120,7 @@ class Arguments {
   private:
     char* _buf;
     bool _shared;
+    bool _persistent;
 
     void appendToEmbeddedList(int& list, char* value);
 
@@ -128,12 +128,14 @@ class Arguments {
     static const char* expandFilePattern(char* dest, size_t max_size, const char* pattern);
     static Output detectOutputFormat(const char* file);
     static long parseUnits(const char* str, const Multiplier* multipliers);
+    static int parseTimeout(const char* str);
 
   public:
     Action _action;
     Counter _counter;
     Ring _ring;
     const char* _event;
+    int _timeout;
     long _interval;
     long _alloc;
     long _lock;
@@ -144,13 +146,17 @@ class Arguments {
     const char* _filter;
     int _include;
     int _exclude;
+    bool _loop;
     bool _threads;
     bool _sched;
+    bool _fdtransfer;
+    const char* _fdtransfer_path;
     int _style;
     CStack _cstack;
     Output _output;
     long _chunk_size;
     long _chunk_time;
+    const char* _jfr_sync;
     int _jfr_options;
     int _dump_traces;
     int _dump_flat;
@@ -161,13 +167,15 @@ class Arguments {
     double _minwidth;
     bool _reverse;
 
-    Arguments() :
+    Arguments(bool persistent = false) :
         _buf(NULL),
         _shared(false),
+        _persistent(persistent),
         _action(ACTION_NONE),
         _counter(COUNTER_SAMPLES),
         _ring(RING_ANY),
         _event(NULL),
+        _timeout(0),
         _interval(0),
         _alloc(0),
         _lock(0),
@@ -178,13 +186,17 @@ class Arguments {
         _filter(NULL),
         _include(0),
         _exclude(0),
+        _loop(false),
         _threads(false),
         _sched(false),
+        _fdtransfer(false),
+        _fdtransfer_path(NULL),
         _style(0),
         _cstack(CSTACK_DEFAULT),
         _output(OUTPUT_NONE),
         _chunk_size(100 * 1024 * 1024),
         _chunk_time(3600),
+        _jfr_sync(NULL),
         _jfr_options(0),
         _dump_traces(0),
         _dump_flat(0),
@@ -200,6 +212,8 @@ class Arguments {
     void save(Arguments& other);
 
     Error parse(const char* args);
+
+    const char* file();
 
     bool hasOutputFile() const {
         return _file != NULL &&

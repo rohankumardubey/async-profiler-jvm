@@ -124,14 +124,14 @@ u64 OS::nanotime() {
     return (u64)mach_absolute_time() * timebase.numer / timebase.denom;
 }
 
-u64 OS::millis() {
+u64 OS::micros() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (u64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    return (u64)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
 void OS::sleep(u64 nanos) {
-    struct timespec ts = {nanos / 1000000000, nanos % 1000000000};
+    struct timespec ts = {(time_t)(nanos / 1000000000), (long)(nanos % 1000000000)};
     nanosleep(&ts, NULL);
 }
 
@@ -174,9 +174,9 @@ int OS::threadId() {
     return (int)port;
 }
 
-const char* OS::schedPolicy() {
+const char* OS::schedPolicy(int thread_id) {
     // Not used on macOS
-    return "[SCHED_OTHER]";
+    return "SCHED_OTHER";
 }
 
 bool OS::threadName(int thread_id, char* name_buf, size_t name_len) {
@@ -216,6 +216,15 @@ SigAction OS::installSignalHandler(int signo, SigAction action, SigHandler handl
 
     sigaction(signo, &sa, &oldsa);
     return oldsa.sa_sigaction;
+}
+
+SigAction OS::replaceCrashHandler(SigAction action) {
+    struct sigaction sa;
+    sigaction(SIGBUS, NULL, &sa);
+    SigAction old_action = sa.sa_sigaction;
+    sa.sa_sigaction = action;
+    sigaction(SIGBUS, &sa, NULL);
+    return old_action;
 }
 
 bool OS::sendSignalToThread(int thread_id, int signo) {
@@ -308,6 +317,10 @@ void OS::copyFile(int src_fd, int dst_fd, off_t offset, size_t size) {
     }
 
     munmap(buf, offset);
+}
+
+void OS::freePageCache(int fd, off_t start_offset) {
+    // Not supported on macOS
 }
 
 #endif // __APPLE__

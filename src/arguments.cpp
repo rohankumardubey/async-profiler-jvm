@@ -46,55 +46,62 @@ static const Multiplier UNIVERSAL[] = {{'n', 1}, {'u', 1000}, {'m', 1000000}, {'
 
 #define CASE(s)        } else if (arg_hash == HASH(s "            ")) {
 
+#define DEFAULT()      } else {
+
 
 // Parses agent arguments.
 // The format of the string is:
 //     arg[,arg...]
 // where arg is one of the following options:
-//     start           - start profiling
-//     resume          - start or resume profiling without resetting collected data
-//     stop            - stop profiling
-//     dump            - dump collected data without stopping profiling session
-//     check           - check if the specified profiling event is available
-//     status          - print profiling status (inactive / running for X seconds)
-//     list            - show the list of available profiling events
-//     version[=full]  - display the agent version
-//     event=EVENT     - which event to trace (cpu, wall, cache-misses, etc.)
-//     alloc[=BYTES]   - profile allocations with BYTES interval
-//     lock[=DURATION] - profile contended locks longer than DURATION ns
-//     collapsed       - dump collapsed stacks (the format used by FlameGraph script)
-//     flamegraph      - produce Flame Graph in HTML format
-//     tree            - produce call tree in HTML format
-//     jfr             - dump events in Java Flight Recorder format
-//     traces[=N]      - dump top N call traces
-//     flat[=N]        - dump top N methods (aka flat profile)
-//     samples         - count the number of samples (default)
-//     total           - count the total value (time, bytes, etc.) instead of samples
-//     chunksize=N     - approximate size of JFR chunk in bytes (default: 100 MB)
-//     chunktime=N     - duration of JFR chunk in seconds (default: 1 hour)
-//     interval=N      - sampling interval in ns (default: 10'000'000, i.e. 10 ms)
-//     jstackdepth=N   - maximum Java stack depth (default: 2048)
-//     safemode=BITS   - disable stack recovery techniques (default: 0, i.e. everything enabled)
-//     file=FILENAME   - output file name for dumping
-//     log=FILENAME    - log warnings and errors to the given dedicated stream
-//     filter=FILTER   - thread filter
-//     threads         - profile different threads separately
-//     sched           - group threads by scheduling policy
-//     cstack=MODE     - how to collect C stack frames in addition to Java stack
-//                       MODE is 'fp' (Frame Pointer), 'lbr' (Last Branch Record) or 'no'
-//     allkernel       - include only kernel-mode events
-//     alluser         - include only user-mode events
-//     simple          - simple class names instead of FQN
-//     dot             - dotted class names
-//     sig             - print method signatures
-//     ann             - annotate Java method names
-//     include=PATTERN - include stack traces containing PATTERN
-//     exclude=PATTERN - exclude stack traces containing PATTERN
-//     begin=FUNCTION  - begin profiling when FUNCTION is executed
-//     end=FUNCTION    - end profiling when FUNCTION is executed
-//     title=TITLE     - FlameGraph title
-//     minwidth=PCT    - FlameGraph minimum frame width in percent
-//     reverse         - generate stack-reversed FlameGraph / Call tree
+//     start            - start profiling
+//     resume           - start or resume profiling without resetting collected data
+//     stop             - stop profiling
+//     dump             - dump collected data without stopping profiling session
+//     check            - check if the specified profiling event is available
+//     status           - print profiling status (inactive / running for X seconds)
+//     list             - show the list of available profiling events
+//     version[=full]   - display the agent version
+//     event=EVENT      - which event to trace (cpu, wall, cache-misses, etc.)
+//     alloc[=BYTES]    - profile allocations with BYTES interval
+//     lock[=DURATION]  - profile contended locks longer than DURATION ns
+//     collapsed        - dump collapsed stacks (the format used by FlameGraph script)
+//     flamegraph       - produce Flame Graph in HTML format
+//     tree             - produce call tree in HTML format
+//     jfr              - dump events in Java Flight Recorder format
+//     jfrsync[=CONFIG] - start Java Flight Recording with the given config along with the profiler 
+//     traces[=N]       - dump top N call traces
+//     flat[=N]         - dump top N methods (aka flat profile)
+//     samples          - count the number of samples (default)
+//     total            - count the total value (time, bytes, etc.) instead of samples
+//     chunksize=N      - approximate size of JFR chunk in bytes (default: 100 MB)
+//     chunktime=N      - duration of JFR chunk in seconds (default: 1 hour)
+//     timeout=TIME     - automatically stop profiler at TIME (absolute or relative)
+//     loop=TIME        - run profiler in a loop (continuous profiling)
+//     interval=N       - sampling interval in ns (default: 10'000'000, i.e. 10 ms)
+//     jstackdepth=N    - maximum Java stack depth (default: 2048)
+//     safemode=BITS    - disable stack recovery techniques (default: 0, i.e. everything enabled)
+//     file=FILENAME    - output file name for dumping
+//     log=FILENAME     - log warnings and errors to the given dedicated stream
+//     filter=FILTER    - thread filter
+//     threads          - profile different threads separately
+//     sched            - group threads by scheduling policy
+//     cstack=MODE      - how to collect C stack frames in addition to Java stack
+//                        MODE is 'fp' (Frame Pointer), 'dwarf', 'lbr' (Last Branch Record) or 'no'
+//     allkernel        - include only kernel-mode events
+//     alluser          - include only user-mode events
+//     fdtransfer       - use fdtransfer to pass fds to the profiler
+//     simple           - simple class names instead of FQN
+//     dot              - dotted class names
+//     sig              - print method signatures
+//     ann              - annotate Java method names
+//     lib              - prepend library names
+//     include=PATTERN  - include stack traces containing PATTERN
+//     exclude=PATTERN  - exclude stack traces containing PATTERN
+//     begin=FUNCTION   - begin profiling when FUNCTION is executed
+//     end=FUNCTION     - end profiling when FUNCTION is executed
+//     title=TITLE      - FlameGraph title
+//     minwidth=PCT     - FlameGraph minimum frame width in percent
+//     reverse          - generate stack-reversed FlameGraph / Call tree
 //
 // It is possible to specify multiple dump options at the same time
 
@@ -105,15 +112,15 @@ Error Arguments::parse(const char* args) {
 
     size_t len = strlen(args);
     free(_buf);
-    _buf = (char*)malloc(len + EXTRA_BUF_SIZE);
+    _buf = (char*)malloc(len + EXTRA_BUF_SIZE + 1);
     if (_buf == NULL) {
         return Error("Not enough memory to parse arguments");
     }
-    strcpy(_buf, args);
+    char* args_copy = strcpy(_buf + EXTRA_BUF_SIZE, args);
 
     const char* msg = NULL;    
 
-    for (char* arg = strtok(_buf, ","); arg != NULL; arg = strtok(NULL, ",")) {
+    for (char* arg = strtok(args_copy, ","); arg != NULL; arg = strtok(NULL, ",")) {
         char* value = strchr(arg, '=');
         if (value != NULL) *value++ = 0;
 
@@ -155,9 +162,14 @@ Error Arguments::parse(const char* args) {
 
             CASE("jfr")
                 _output = OUTPUT_JFR;
-                _jfr_options = value == NULL ? 0 :
-                               strcmp(value, "combine") == 0 ? JFR_COMBINE :
-                               (int)strtol(value, NULL, 0);
+                if (value != NULL) {
+                    _jfr_options = (int)strtol(value, NULL, 0);
+                }
+
+            CASE("jfrsync")
+                _output = OUTPUT_JFR;
+                _jfr_options = JFR_SYNC_OPTS;
+                _jfr_sync = value == NULL ? "default" : value;
 
             CASE("traces")
                 _output = OUTPUT_TEXT;
@@ -177,12 +189,12 @@ Error Arguments::parse(const char* args) {
                 if (value == NULL || (_chunk_size = parseUnits(value, BYTES)) < 0) {
                     msg = "Invalid chunksize";
                 }
-            
+
             CASE("chunktime")
                 if (value == NULL || (_chunk_time = parseUnits(value, SECONDS)) < 0) {
                     msg = "Invalid chunktime";
                 }
-            
+
             // Basic options
             CASE("event")
                 if (value == NULL || value[0] == 0) {
@@ -195,6 +207,17 @@ Error Arguments::parse(const char* args) {
                     msg = "Duplicate event argument";
                 } else {
                     _event = value;
+                }
+
+            CASE("timeout")
+                if (value == NULL || (_timeout = parseTimeout(value)) == -1 || !_persistent) {
+                    msg = "Invalid timeout";
+                }
+
+            CASE("loop")
+                _loop = true;
+                if (value == NULL || (_timeout = parseTimeout(value)) == -1 || !_persistent) {
+                    msg = "Invalid loop duration";
                 }
 
             CASE("alloc")
@@ -231,6 +254,10 @@ Error Arguments::parse(const char* args) {
             CASE("log")
                 _log = value == NULL || value[0] == 0 ? NULL : value;
 
+            CASE("fdtransfer")
+                _fdtransfer = true;
+                _fdtransfer_path = value;
+
             // Filters
             CASE("filter")
                 _filter = value == NULL ? "" : value;
@@ -257,6 +284,8 @@ Error Arguments::parse(const char* args) {
                 if (value != NULL) {
                     if (value[0] == 'n') {
                         _cstack = CSTACK_NO;
+                    } else if (value[0] == 'd') {
+                        _cstack = CSTACK_DWARF;
                     } else if (value[0] == 'l') {
                         _cstack = CSTACK_LBR;
                     } else {
@@ -277,6 +306,9 @@ Error Arguments::parse(const char* args) {
             CASE("ann")
                 _style |= STYLE_ANNOTATE;
 
+            CASE("lib")
+                _style |= STYLE_LIB_NAMES;
+
             CASE("begin")
                 _begin = value;
 
@@ -292,6 +324,9 @@ Error Arguments::parse(const char* args) {
 
             CASE("reverse")
                 _reverse = true;
+
+            DEFAULT()
+                msg = "Unknown argument";
         }
     }
 
@@ -302,10 +337,6 @@ Error Arguments::parse(const char* args) {
 
     if (_event == NULL && _alloc == 0 && _lock == 0) {
         _event = EVENT_CPU;
-    }
-
-    if (_file != NULL && strchr(_file, '%') != NULL) {
-        _file = expandFilePattern(_buf + len + 1, EXTRA_BUF_SIZE - 1, _file);
     }
 
     if (_file != NULL && _output == OUTPUT_NONE) {
@@ -322,6 +353,13 @@ Error Arguments::parse(const char* args) {
     }
 
     return Error::OK;
+}
+
+const char* Arguments::file() {
+    if (_file != NULL && strchr(_file, '%') != NULL) {
+        return expandFilePattern(_buf, EXTRA_BUF_SIZE - 1, _file);
+    }
+    return _file;
 }
 
 // The linked list of string offsets is embedded right into _buf array
@@ -362,6 +400,19 @@ const char* Arguments::expandFilePattern(char* dest, size_t max_size, const char
                                 t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                                 t.tm_hour, t.tm_min, t.tm_sec);
                 continue;
+            } else if (c == '{') {
+                char env_key[128];
+                const char* p = strchr(pattern, '}');
+                if (p != NULL && p - pattern < sizeof(env_key)) {
+                    memcpy(env_key, pattern, p - pattern);
+                    env_key[p - pattern] = 0;
+                    const char* env_value = getenv(env_key);
+                    if (env_value != NULL) {
+                        ptr += snprintf(ptr, end - ptr, "%s", env_value);
+                        pattern = p + 1;
+                        continue;
+                    }
+                }
             }
         }
         *ptr++ = c;
@@ -406,6 +457,18 @@ long Arguments::parseUnits(const char* str, const Multiplier* multipliers) {
     }
 
     return -1;
+}
+
+int Arguments::parseTimeout(const char* str) {
+    const char* p = strchr(str, ':');
+    if (p == NULL) {
+        return parseUnits(str, SECONDS);
+    }
+
+    int hh = str[0] >= '0' && str[0] <= '2' ? atoi(str) : 0xff;
+    int mm = p[1] >= '0' && p[1] <= '5' ? atoi(p + 1) : 0xff;
+    int ss = (p = strchr(p + 1, ':')) != NULL && p[1] >= '0' && p[1] <= '5' ? atoi(p + 1) : 0xff;
+    return 0xff000000 | hh << 16 | mm << 8 | ss;
 }
 
 Arguments::~Arguments() {

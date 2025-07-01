@@ -20,8 +20,6 @@
 #include <cxxabi.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,12 +34,17 @@
 #include "spinLock.h"
 #include "symbols.h"
 #include "threadFilter.h"
+#include "tsc.h"
 #include "vmStructs.h"
 
 
-static const unsigned char JFR_COMBINER_CLASS[] = {
-#include "helper/one/profiler/JfrCombiner.class.h"
+static const unsigned char JFR_SYNC_CLASS[] = {
+#include "helper/one/profiler/JfrSync.class.h"
 };
+
+static void JNICALL JfrSync_stopProfiler(JNIEnv* env, jclass cls) {
+    Profiler::instance()->stop();
+}
 
 
 const int BUFFER_SIZE = 1024;
@@ -49,22 +52,19 @@ const int BUFFER_LIMIT = BUFFER_SIZE - 128;
 const int RECORDING_BUFFER_SIZE = 65536;
 const int RECORDING_BUFFER_LIMIT = RECORDING_BUFFER_SIZE - 4096;
 const int MAX_STRING_LENGTH = 8191;
+const u64 MAX_JLONG = 0x7fffffffffffffffULL;
+const u64 MIN_JLONG = 0x8000000000000000ULL;
 
 
 static SpinLock _rec_lock(1);
 
+static jclass _jfr_sync_class = NULL;
+static jmethodID _start_method;
+static jmethodID _stop_method;
+static jmethodID _box_method;
+
 static const char* const SETTING_RING[] = {NULL, "kernel", "user"};
-static const char* const SETTING_CSTACK[] = {NULL, "no", "fp", "lbr"};
-
-
-enum FrameTypeId {
-    FRAME_INTERPRETED  = 0,
-    FRAME_JIT_COMPILED = 1,
-    FRAME_INLINED      = 2,
-    FRAME_NATIVE       = 3,
-    FRAME_CPP          = 4,
-    FRAME_KERNEL       = 5,
-};
+static const char* const SETTING_CSTACK[] = {NULL, "no", "fp", "dwarf", "lbr"};
 
 
 struct CpuTime {
@@ -132,7 +132,15 @@ class Lookup {
 
   private:
     void fillNativeMethodInfo(MethodInfo* mi, const char* name) {
-        mi->_class = _classes->lookup("");
+        const char* lib_name = name == NULL ? NULL : Profiler::instance()->getLibraryName(name);
+        if (lib_name == NULL) {
+            mi->_class = _classes->lookup("");
+        } else if (lib_name[0] == '[' && lib_name[1] != 0) {
+            mi->_class = _classes->lookup(lib_name + 1, strlen(lib_name) - 2);
+        } else {
+            mi->_class = _classes->lookup(lib_name);
+        }
+
         mi->_modifiers = 0x100;
         mi->_line_number_table_size = 0;
         mi->_line_number_table = NULL;
@@ -231,6 +239,12 @@ class Lookup {
         const char* package = strrchr(class_name, '/');
         if (package == NULL) {
             return 0;
+        }
+        if (package[1] >= '0' && package[1] <= '9') {
+            // Seems like a hidden or anonymous class, e.g. com/example/Foo/0x012345
+            do {
+                if (package == class_name) return 0;
+            } while (*--package != '/');
         }
         if (class_name[0] == '[') {
             class_name = strchr(class_name, 'L') + 1;
@@ -368,8 +382,6 @@ class RecordingBuffer : public Buffer {
 
 class Recording {
   private:
-    static int _append_fd;
-
     static char* _agent_properties;
     static char* _jvm_args;
     static char* _jvm_flags;
@@ -377,16 +389,15 @@ class Recording {
 
     RecordingBuffer _buf[CONCURRENCY_LEVEL];
     int _fd;
-    volatile bool _timer_is_running;
-    pthread_t _timer_thread;
+    char* _master_recording_file;
     off_t _chunk_start;
     ThreadFilter _thread_set;
     MethodMap _method_map;
 
     u64 _start_time;
-    u64 _start_nanos;
+    u64 _start_ticks;
     u64 _stop_time;
-    u64 _stop_nanos;
+    u64 _stop_ticks;
 
     u64 _base_id;
     u64 _bytes_written;
@@ -400,6 +411,126 @@ class Recording {
     bool _cpu_monitor_enabled;
     Buffer _cpu_monitor_buf;
     CpuTimes _last_times;
+
+    static float ratio(float value) {
+        return value < 0 ? 0 : value > 1 ? 1 : value;
+    }
+
+  public:
+    Recording(int fd, Arguments& args) : _fd(fd), _thread_set(), _method_map() {
+        _master_recording_file = args._jfr_sync == NULL ? NULL : strdup(args.file());
+        _chunk_start = lseek(_fd, 0, SEEK_END);
+        _start_time = OS::micros();
+        _start_ticks = TSC::ticks();
+        _base_id = 0;
+        _bytes_written = 0;
+
+        _chunk_size = args._chunk_size <= 0 ? MAX_JLONG : (args._chunk_size < 262144 ? 262144 : args._chunk_size);
+        _chunk_time = args._chunk_time <= 0 ? MAX_JLONG : (args._chunk_time < 5 ? 5 : args._chunk_time) * 1000000ULL;
+
+        _tid = OS::threadId();
+        addThread(_tid);
+        VM::jvmti()->GetAvailableProcessors(&_available_processors);
+
+        writeHeader(_buf);
+        writeMetadata(_buf);
+        writeRecordingInfo(_buf);
+        writeSettings(_buf, args);
+        if (!args.hasOption(NO_SYSTEM_INFO)) {
+            writeOsCpuInfo(_buf);
+            writeJvmInfo(_buf);
+        }
+        if (!args.hasOption(NO_SYSTEM_PROPS)) {
+            writeSystemProperties(_buf);
+        }
+        if (!args.hasOption(NO_NATIVE_LIBS)) {
+            _recorded_lib_count = 0;
+            writeNativeLibraries(_buf);
+        } else {
+            _recorded_lib_count = -1;
+        }
+        flush(_buf);
+
+        _cpu_monitor_enabled = !args.hasOption(NO_CPU_LOAD);
+        if (_cpu_monitor_enabled) {
+            _last_times.proc.real = OS::getProcessCpuTime(&_last_times.proc.user, &_last_times.proc.system);
+            _last_times.total.real = OS::getTotalCpuTime(&_last_times.total.user, &_last_times.total.system);
+        }
+    }
+
+    ~Recording() {
+        off_t chunk_end = finishChunk();
+
+        if (_master_recording_file != NULL) {
+            appendRecording(_master_recording_file, chunk_end);
+            free(_master_recording_file);
+        }
+
+        close(_fd);
+    }
+
+    off_t finishChunk() {
+        flush(&_cpu_monitor_buf);
+
+        writeNativeLibraries(_buf);
+
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            flush(&_buf[i]);
+        }
+
+        _stop_time = OS::micros();
+        _stop_ticks = TSC::ticks();
+
+        off_t cpool_offset = lseek(_fd, 0, SEEK_CUR);
+        writeCpool(_buf);
+        flush(_buf);
+
+        off_t chunk_end = lseek(_fd, 0, SEEK_CUR);
+
+        // Patch cpool size field
+        _buf->putVar32(0, chunk_end - cpool_offset);
+        ssize_t result = pwrite(_fd, _buf->data(), 5, cpool_offset);
+        (void)result;
+
+        // Workaround for JDK-8191415: compute actual TSC frequency, in case JFR is wrong
+        u64 tsc_frequency = TSC::frequency();
+        if (tsc_frequency > 1000000000) {
+            tsc_frequency = (u64)(double(_stop_ticks - _start_ticks) / double(_stop_time - _start_time) * 1000000);
+        }
+
+        // Patch chunk header
+        _buf->put64(chunk_end - _chunk_start);
+        _buf->put64(cpool_offset - _chunk_start);
+        _buf->put64(68);
+        _buf->put64(_start_time * 1000);
+        _buf->put64((_stop_time - _start_time) * 1000);
+        _buf->put64(_start_ticks);
+        _buf->put64(tsc_frequency);
+        result = pwrite(_fd, _buf->data(), 56, _chunk_start + 8);
+        (void)result;
+
+        OS::freePageCache(_fd, _chunk_start);
+
+        _buf->reset();
+        return chunk_end;
+    }
+
+    void switchChunk() {
+        _chunk_start = finishChunk();
+        _start_time = _stop_time;
+        _start_ticks = _stop_ticks;
+        _base_id += 0x1000000;
+        _bytes_written = 0;
+
+        writeHeader(_buf);
+        writeMetadata(_buf);
+        writeRecordingInfo(_buf);
+        flush(_buf);
+    }
+
+    bool needSwitchChunk(u64 wall_time) {
+        return loadAcquire(_bytes_written) >= _chunk_size || wall_time - _start_time >= _chunk_time;
+    }
 
     void cpuMonitorCycle() {
         if (!_cpu_monitor_enabled) return;
@@ -431,183 +562,19 @@ class Recording {
         _last_times = times;
     }
 
-    bool needSwitchChunk() {
-        return loadAcquire(_bytes_written) >= _chunk_size || OS::millis() - _start_time >= _chunk_time;
+    bool hasMasterRecording() const {
+        return _master_recording_file != NULL;
     }
 
-    void timerLoop() {
-        u64 current_time = OS::nanotime();
-
-        while (_timer_is_running) {
-            u64 sleep_until = current_time + 1000000000;
-            while ((current_time = OS::nanotime()) < sleep_until) {
-                OS::sleep(sleep_until - current_time);
-                if (!_timer_is_running) return;
-            }
-
-            bool need_switch_chunk = false;
-
-            if (_rec_lock.tryLockShared()) {
-                cpuMonitorCycle();
-                need_switch_chunk = needSwitchChunk();
-                _rec_lock.unlockShared();
-            }
-
-            if (need_switch_chunk) {
-                // Switch JFR chunk under the profiling state lock
-                Profiler::instance()->flushJfr();
-            }
-        }
-    }
-
-    static void* threadEntry(void* rec) {
-        VM::attachThread("Async-profiler Timer");
-        ((Recording*)rec)->timerLoop();
-        VM::detachThread();
-        return NULL;
-    }
-
-    void startTimer() {
-        _timer_is_running = true;
-        if (pthread_create(&_timer_thread, NULL, threadEntry, this) != 0) {
-            Log::warn("Unable to create JFR timer thread");
-            _timer_is_running = false;
-        }
-    }
-
-    void stopTimer() {
-        if (_timer_is_running) {
-            _timer_is_running = false;
-            pthread_kill(_timer_thread, WAKEUP_SIGNAL);
-            pthread_join(_timer_thread, NULL);
-        }
-    }
-
-    static float ratio(float value) {
-        return value < 0 ? 0 : value > 1 ? 1 : value;
-    }
-
-  public:
-    Recording(int fd, Arguments& args) : _fd(fd), _thread_set(), _method_map() {
-        _chunk_start = lseek(_fd, 0, SEEK_END);
-        _start_time = OS::millis();
-        _start_nanos = OS::nanotime();
-        _base_id = 0;
-        _bytes_written = 0;
-
-        _chunk_size = args._chunk_size <= 0 ? LONG_MAX : (args._chunk_size < 262144 ? 262144 : args._chunk_size);
-        _chunk_time = args._chunk_time <= 0 ? LONG_MAX : (args._chunk_time < 10 ? 10 : args._chunk_time) * 1000;
-
-        _tid = OS::threadId();
-        addThread(_tid);
-        VM::jvmti()->GetAvailableProcessors(&_available_processors);
-
-        writeHeader(_buf);
-        writeMetadata(_buf);
-        writeRecordingInfo(_buf);
-        writeSettings(_buf, args);
-        if (!args.hasOption(NO_SYSTEM_INFO)) {
-            writeOsCpuInfo(_buf);
-            writeJvmInfo(_buf);
-        }
-        if (!args.hasOption(NO_SYSTEM_PROPS)) {
-            writeSystemProperties(_buf);
-        }
-        if (!args.hasOption(NO_NATIVE_LIBS)) {
-            _recorded_lib_count = 0;
-            writeNativeLibraries(_buf);
+    void appendRecording(const char* target_file, size_t size) {
+        int append_fd = open(target_file, O_WRONLY);
+        if (append_fd >= 0) {
+            lseek(append_fd, 0, SEEK_END);
+            OS::copyFile(_fd, append_fd, 0, size);
+            close(append_fd);
         } else {
-            _recorded_lib_count = -1;
+            Log::warn("Failed to open JFR recording at %s: %s", target_file, strerror(errno));
         }
-        flush(_buf);
-
-        _cpu_monitor_enabled = !args.hasOption(NO_CPU_LOAD);
-        if (_cpu_monitor_enabled) {
-            _last_times.proc.real = OS::getProcessCpuTime(&_last_times.proc.user, &_last_times.proc.system);
-            _last_times.total.real = OS::getTotalCpuTime(&_last_times.total.user, &_last_times.total.system);
-        }
-
-        startTimer();
-    }
-
-    ~Recording() {
-        stopTimer();
-
-        off_t chunk_end = finishChunk();
-
-        if (_append_fd >= 0) {
-            OS::copyFile(_fd, _append_fd, 0, chunk_end);
-        }
-
-        close(_fd);
-    }
-
-    off_t finishChunk() {
-        flush(&_cpu_monitor_buf);
-
-        writeNativeLibraries(_buf);
-
-        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
-            flush(&_buf[i]);
-        }
-
-        _stop_nanos = OS::nanotime();
-        _stop_time = OS::millis();
-
-        off_t cpool_offset = lseek(_fd, 0, SEEK_CUR);
-        writeCpool(_buf);
-        flush(_buf);
-
-        off_t chunk_end = lseek(_fd, 0, SEEK_CUR);
-
-        // Patch cpool size field
-        _buf->putVar32(0, chunk_end - cpool_offset);
-        ssize_t result = pwrite(_fd, _buf->data(), 5, cpool_offset);
-        (void)result;
-
-        // Patch chunk header
-        _buf->put64(chunk_end - _chunk_start);
-        _buf->put64(cpool_offset - _chunk_start);
-        _buf->put64(68);
-        _buf->put64(_start_time * 1000000);
-        _buf->put64(_stop_nanos - _start_nanos);
-        result = pwrite(_fd, _buf->data(), 40, _chunk_start + 8);
-        (void)result;
-
-        _buf->reset();
-        return chunk_end;
-    }
-
-    void switchChunk() {
-        _chunk_start = finishChunk();
-        _start_time = _stop_time;
-        _start_nanos = _stop_nanos;
-        _base_id += 0x1000000;
-        _bytes_written = 0;
-
-        writeHeader(_buf);
-        writeMetadata(_buf);
-        writeRecordingInfo(_buf);
-        flush(_buf);
-    }
-
-    static void JNICALL appendRecording(JNIEnv* env, jclass cls, jstring file_name) {
-        const char* file_name_str = env->GetStringUTFChars(file_name, NULL);
-        if (file_name_str == NULL) {
-            return;
-        }
-
-        _append_fd = open(file_name_str, O_WRONLY);
-        if (_append_fd >= 0) {
-            lseek(_append_fd, 0, SEEK_END);
-            Profiler::instance()->stop();
-            close(_append_fd);
-            _append_fd = -1;
-        } else {
-            Log::warn("Failed to open JFR recording at %s: %s", file_name_str, strerror(errno));
-        }
-
-        env->ReleaseStringUTFChars(file_name, file_name_str);
     }
 
     Buffer* buffer(int lock_index) {
@@ -617,7 +584,10 @@ class Recording {
     bool parseAgentProperties() {
         JNIEnv* env = VM::jni();
         jclass vm_support = env->FindClass("jdk/internal/vm/VMSupport");
-        if (vm_support == NULL) vm_support = env->FindClass("sun/misc/VMSupport");
+        if (vm_support == NULL) {
+            env->ExceptionClear();
+            vm_support = env->FindClass("sun/misc/VMSupport");
+        }
         if (vm_support != NULL) {
             jmethodID get_agent_props = env->GetStaticMethodID(vm_support, "getAgentProperties", "()Ljava/util/Properties;");
             jmethodID to_string = env->GetMethodID(env->FindClass("java/lang/Object"), "toString", "()Ljava/lang/String;");
@@ -675,23 +645,23 @@ class Recording {
     }
 
     void writeHeader(Buffer* buf) {
-        buf->put("FLR\0", 4);               // magic
-        buf->put16(2);                      // major
-        buf->put16(0);                      // minor
-        buf->put64(0);                      // chunk size
-        buf->put64(0);                      // cpool offset
-        buf->put64(0);                      // meta offset
-        buf->put64(_start_time * 1000000);  // start time, ns
-        buf->put64(0);                      // duration, ns
-        buf->put64(_start_nanos);           // start ticks
-        buf->put64(1000000000);             // ticks per sec
-        buf->put32(1);                      // features
+        buf->put("FLR\0", 4);            // magic
+        buf->put16(2);                   // major
+        buf->put16(0);                   // minor
+        buf->put64(1024 * 1024 * 1024);  // chunk size (initially large, for JMC to skip incomplete chunk)
+        buf->put64(0);                   // cpool offset
+        buf->put64(0);                   // meta offset
+        buf->put64(_start_time * 1000);  // start time, ns
+        buf->put64(0);                   // duration, ns
+        buf->put64(_start_ticks);        // start ticks
+        buf->put64(TSC::frequency());    // ticks per sec
+        buf->put32(1);                   // features
     }
 
     void writeMetadata(Buffer* buf) {
         int metadata_start = buf->skip(5);  // size will be patched later
         buf->putVar32(T_METADATA);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putVar32(0);
         buf->putVar32(1);
 
@@ -724,16 +694,16 @@ class Recording {
     void writeRecordingInfo(Buffer* buf) {
         int start = buf->skip(1);
         buf->put8(T_ACTIVE_RECORDING);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putVar32(0);
         buf->putVar32(_tid);
         buf->putVar32(1);
         buf->putUtf8("async-profiler " PROFILER_VERSION);
         buf->putUtf8("async-profiler.jfr");
-        buf->putVar64(0x7fffffffffffffffULL);
+        buf->putVar64(MAX_JLONG);
         buf->putVar32(0);
-        buf->putVar64(_start_time);
-        buf->putVar64(0x7fffffffffffffffULL);
+        buf->putVar64(_start_time / 1000);
+        buf->putVar64(MAX_JLONG);
         buf->put8(start, buf->offset() - start);
     }
 
@@ -772,15 +742,15 @@ class Recording {
 
         writeBoolSetting(buf, T_ACTIVE_RECORDING, "debugSymbols", VMStructs::hasDebugSymbols());
         writeBoolSetting(buf, T_ACTIVE_RECORDING, "kernelSymbols", Symbols::haveKernelSymbols());
-        writeBoolSetting(buf, T_ACTIVE_RECORDING, "loadLibraryHook", Profiler::instance()->_original_NativeLibrary_load != NULL);
     }
 
     void writeStringSetting(Buffer* buf, int category, const char* key, const char* value) {
         int start = buf->skip(5);
         buf->put8(T_ACTIVE_SETTING);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putVar32(0);
         buf->putVar32(_tid);
+        buf->putVar32(0);
         buf->putVar32(category);
         buf->putUtf8(key);
         buf->putUtf8(value);
@@ -792,9 +762,9 @@ class Recording {
         writeStringSetting(buf, category, key, value ? "true" : "false");
     }
 
-    void writeIntSetting(Buffer* buf, int category, const char* key, long value) {
+    void writeIntSetting(Buffer* buf, int category, const char* key, long long value) {
         char str[32];
-        sprintf(str, "%ld", value);
+        sprintf(str, "%lld", value);
         writeStringSetting(buf, category, key, str);
     }
 
@@ -817,13 +787,13 @@ class Recording {
 
         int start = buf->skip(5);
         buf->put8(T_OS_INFORMATION);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putUtf8(str);
         buf->putVar32(start, buf->offset() - start);
 
         start = buf->skip(5);
         buf->put8(T_CPU_INFORMATION);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putUtf8(u.machine);
         buf->putUtf8(OS::getCpuDescription(str, sizeof(str) - 1) ? str : "");
         buf->putVar32(1);
@@ -847,7 +817,7 @@ class Recording {
         flushIfNeeded(buf, RECORDING_BUFFER_LIMIT - 5 * MAX_STRING_LENGTH);
         int start = buf->skip(5);
         buf->put8(T_JVM_INFORMATION);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putUtf8(jvm_name);
         buf->putUtf8(jvm_version);
         buf->putUtf8(_jvm_args);
@@ -876,7 +846,7 @@ class Recording {
                 flushIfNeeded(buf, RECORDING_BUFFER_LIMIT - 2 * MAX_STRING_LENGTH);
                 int start = buf->skip(5);
                 buf->put8(T_INITIAL_SYSTEM_PROPERTY);
-                buf->putVar64(_start_nanos);
+                buf->putVar64(_start_ticks);
                 buf->putUtf8(key);
                 buf->putUtf8(value);
                 buf->putVar32(start, buf->offset() - start);
@@ -891,14 +861,14 @@ class Recording {
         if (_recorded_lib_count < 0) return;
 
         Profiler* profiler = Profiler::instance();
-        NativeCodeCache** native_libs = profiler->_native_libs;
+        CodeCache** native_libs = profiler->_native_libs;
         int native_lib_count = profiler->_native_lib_count;
 
         for (int i = _recorded_lib_count; i < native_lib_count; i++) {
             flushIfNeeded(buf, RECORDING_BUFFER_LIMIT - MAX_STRING_LENGTH);
             int start = buf->skip(5);
             buf->put8(T_NATIVE_LIBRARY);
-            buf->putVar64(_start_nanos);
+            buf->putVar64(_start_ticks);
             buf->putUtf8(native_libs[i]->name());
             buf->putVar64((uintptr_t) native_libs[i]->minAddress());
             buf->putVar64((uintptr_t) native_libs[i]->maxAddress());
@@ -911,7 +881,7 @@ class Recording {
     void writeCpool(Buffer* buf) {
         buf->skip(5);  // size will be patched later
         buf->putVar32(T_CPOOL);
-        buf->putVar64(_start_nanos);
+        buf->putVar64(_start_ticks);
         buf->putVar32(0);
         buf->putVar32(0);
         buf->putVar32(1);
@@ -1001,14 +971,16 @@ class Recording {
                 MethodInfo* mi = lookup->resolveMethod(trace->frames[i]);
                 buf->putVar32(mi->_key);
                 jint bci = trace->frames[i].bci;
+                FrameTypeId type = bci >= 0 ? (FrameTypeId)(bci >> 24) : mi->_type;
                 if (bci >= 0) {
+                    bci &= 0xffffff;
                     buf->putVar32(mi->getLineNumber(bci));
                     buf->putVar32(bci);
                 } else {
                     buf->put8(0);
                     buf->put8(0);
                 }
-                buf->putVar32(mi->_type);
+                buf->put8(type);
                 flushIfNeeded(buf);
             }
             flushIfNeeded(buf);
@@ -1097,7 +1069,7 @@ class Recording {
     void recordExecutionSample(Buffer* buf, int tid, u32 call_trace_id, ExecutionEvent* event) {
         int start = buf->skip(1);
         buf->put8(T_EXECUTION_SAMPLE);
-        buf->putVar64(OS::nanotime());
+        buf->putVar64(TSC::ticks());
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
         buf->putVar32(event->_thread_state);
@@ -1107,7 +1079,7 @@ class Recording {
     void recordAllocationInNewTLAB(Buffer* buf, int tid, u32 call_trace_id, AllocEvent* event) {
         int start = buf->skip(1);
         buf->put8(T_ALLOC_IN_NEW_TLAB);
-        buf->putVar64(OS::nanotime());
+        buf->putVar64(TSC::ticks());
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
         buf->putVar32(event->_class_id);
@@ -1119,7 +1091,7 @@ class Recording {
     void recordAllocationOutsideTLAB(Buffer* buf, int tid, u32 call_trace_id, AllocEvent* event) {
         int start = buf->skip(1);
         buf->put8(T_ALLOC_OUTSIDE_TLAB);
-        buf->putVar64(OS::nanotime());
+        buf->putVar64(TSC::ticks());
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
         buf->putVar32(event->_class_id);
@@ -1135,6 +1107,7 @@ class Recording {
         buf->putVar32(tid);
         buf->putVar32(call_trace_id);
         buf->putVar32(event->_class_id);
+        buf->put8(0);
         buf->putVar64(event->_address);
         buf->put8(start, buf->offset() - start);
     }
@@ -1148,6 +1121,7 @@ class Recording {
         buf->putVar32(call_trace_id);
         buf->putVar32(event->_class_id);
         buf->putVar64(event->_timeout);
+        buf->putVar64(MIN_JLONG);
         buf->putVar64(event->_address);
         buf->put8(start, buf->offset() - start);
     }
@@ -1168,7 +1142,7 @@ class Recording {
     void recordCpuLoad(Buffer* buf, float proc_user, float proc_system, float machine_total) {
         int start = buf->skip(1);
         buf->put8(T_CPU_LOAD);
-        buf->putVar64(OS::nanotime());
+        buf->putVar64(TSC::ticks());
         buf->putFloat(proc_user);
         buf->putFloat(proc_system);
         buf->putFloat(machine_total);
@@ -1182,8 +1156,6 @@ class Recording {
     }
 };
 
-int Recording::_append_fd = -1;
-
 char* Recording::_agent_properties = NULL;
 char* Recording::_jvm_args = NULL;
 char* Recording::_jvm_flags = NULL;
@@ -1191,21 +1163,37 @@ char* Recording::_java_command = NULL;
 
 
 Error FlightRecorder::start(Arguments& args, bool reset) {
-    if (args._file == NULL || args._file[0] == 0) {
+    const char* filename = args.file();
+    if (filename == NULL || filename[0] == 0) {
         return Error("Flight Recorder output file is not specified");
     }
 
-    if (args.hasOption(JFR_SYNC) && !loadJavaHelper()) {
-        return Error("Could not load JFR combiner class");
+    char* filename_tmp = NULL;
+    if (args._jfr_sync != NULL) {
+        Error error = startMasterRecording(args);
+        if (error) {
+            return error;
+        }
+
+        size_t len = strlen(filename);
+        filename_tmp = (char*)malloc(len + 16);
+        snprintf(filename_tmp, len + 16, "%s.%d~", filename, OS::processId());
+        filename = filename_tmp;
     }
 
-    int fd = open(args._file, O_CREAT | O_RDWR | (reset ? O_TRUNC : 0), 0644);
+    if (!TSC::initialized()) {
+        TSC::initialize();
+    }
+
+    int fd = open(filename, O_CREAT | O_RDWR | (reset ? O_TRUNC : 0), 0644);
     if (fd == -1) {
+        free(filename_tmp);
         return Error("Could not open Flight Recorder output file");
     }
 
-    if (args.hasOption(JFR_TEMP_FILE)) {
-        unlink(args._file);
+    if (args._jfr_sync != NULL) {
+        unlink(filename_tmp);
+        free(filename_tmp);
     }
 
     _rec = new Recording(fd, args);
@@ -1216,6 +1204,11 @@ Error FlightRecorder::start(Arguments& args, bool reset) {
 void FlightRecorder::stop() {
     if (_rec != NULL) {
         _rec_lock.lock();
+
+        if (_rec->hasMasterRecording()) {
+            stopMasterRecording();
+        }
+
         delete _rec;
         _rec = NULL;
     }
@@ -1229,24 +1222,77 @@ void FlightRecorder::flush() {
     }
 }
 
-bool FlightRecorder::loadJavaHelper() {
-    if (!_java_helper_loaded) {
-        JNIEnv* jni = VM::jni();
-        const JNINativeMethod native_method = {
-            (char*)"appendRecording", (char*)"(Ljava/lang/String;)V",
-            (void*)Recording::appendRecording
-        };
-
-        jclass cls = jni->DefineClass(NULL, NULL, (const jbyte*)JFR_COMBINER_CLASS, sizeof(JFR_COMBINER_CLASS));
-        if (cls == NULL || jni->RegisterNatives(cls, &native_method, 1) != 0 || jni->GetMethodID(cls, "<init>", "()V") == NULL) {
-            jni->ExceptionClear();
-            return false;
-        }
-
-        _java_helper_loaded = true;
+bool FlightRecorder::timerTick(u64 wall_time) {
+    if (!_rec_lock.tryLockShared()) {
+        // No active recording
+        return false;
     }
 
-    return true;
+    _rec->cpuMonitorCycle();
+    bool need_switch_chunk = _rec->needSwitchChunk(wall_time);
+
+    _rec_lock.unlockShared();
+    return need_switch_chunk;
+}
+
+Error FlightRecorder::startMasterRecording(Arguments& args) {
+    JNIEnv* env = VM::jni();
+
+    if (_jfr_sync_class == NULL) {
+        const JNINativeMethod native_method = {(char*)"stopProfiler", (char*)"()V", (void*)JfrSync_stopProfiler};
+
+        jclass cls = env->DefineClass(NULL, NULL, (const jbyte*)JFR_SYNC_CLASS, sizeof(JFR_SYNC_CLASS));
+        if (cls == NULL || env->RegisterNatives(cls, &native_method, 1) != 0
+                || (_start_method = env->GetStaticMethodID(cls, "start", "(Ljava/lang/String;Ljava/lang/String;I)V")) == NULL
+                || (_stop_method = env->GetStaticMethodID(cls, "stop", "()V")) == NULL
+                || (_box_method = env->GetStaticMethodID(cls, "box", "(I)Ljava/lang/Integer;")) == NULL
+                || (_jfr_sync_class = (jclass)env->NewGlobalRef(cls)) == NULL) {
+            env->ExceptionDescribe();
+            return Error("Failed to initialize JfrSync class");
+        }
+    }
+
+    jclass options_class = env->FindClass("jdk/jfr/internal/Options");
+    if (options_class != NULL) {
+        if (args._chunk_size > 0) {
+            jmethodID method = env->GetStaticMethodID(options_class, "setMaxChunkSize", "(J)V");
+            if (method != NULL) {
+                env->CallStaticVoidMethod(options_class, method, args._chunk_size < 1024 * 1024 ? 1024 * 1024 : args._chunk_size);
+            }
+        }
+
+        if (args._jstackdepth > 0) {
+            jmethodID method = env->GetStaticMethodID(options_class, "setStackDepth", "(Ljava/lang/Integer;)V");
+            if (method != NULL) {
+                jobject value = env->CallStaticObjectMethod(_jfr_sync_class, _box_method, args._jstackdepth);
+                if (value != NULL) {
+                    env->CallStaticVoidMethod(options_class, method, value);
+                }
+            }
+        }
+    }
+    env->ExceptionClear();
+
+    jobject jfilename = env->NewStringUTF(args.file());
+    jobject jsettings = args._jfr_sync == NULL ? NULL : env->NewStringUTF(args._jfr_sync);
+    int event_mask = (args._event != NULL ? 1 : 0) |
+                     (args._alloc > 0 ? 2 : 0) |
+                     (args._lock > 0 ? 4 : 0);
+
+    env->CallStaticVoidMethod(_jfr_sync_class, _start_method, jfilename, jsettings, event_mask);
+
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        return Error("Could not start master JFR recording");
+    }
+
+    return Error::OK;
+}
+
+void FlightRecorder::stopMasterRecording() {
+    JNIEnv* env = VM::jni();
+    env->CallStaticVoidMethod(_jfr_sync_class, _stop_method);
+    env->ExceptionClear();
 }
 
 void FlightRecorder::recordEvent(int lock_index, int tid, u32 call_trace_id,
@@ -1290,7 +1336,7 @@ void FlightRecorder::recordLog(LogLevel level, const char* message, size_t len) 
 
     int start = buf->skip(5);
     buf->put8(T_LOG);
-    buf->putVar64(OS::nanotime());
+    buf->putVar64(TSC::ticks());
     buf->put8(level);
     buf->putUtf8(message, len);
     buf->putVar32(start, buf->offset() - start);

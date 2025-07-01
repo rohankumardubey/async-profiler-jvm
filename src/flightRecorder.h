@@ -27,19 +27,20 @@ class Recording;
 class FlightRecorder {
   private:
     Recording* _rec;
-    bool _java_helper_loaded;
 
-    bool loadJavaHelper();
+    Error startMasterRecording(Arguments& args);
+    void stopMasterRecording();
 
   public:
-    FlightRecorder() : _rec(NULL), _java_helper_loaded(false) {
+    FlightRecorder() : _rec(NULL) {
     }
 
     Error start(Arguments& args, bool reset);
     void stop();
     void flush();
+    bool timerTick(u64 wall_time);
 
-    bool active() {
+    bool active() const {
         return _rec != NULL;
     }
 

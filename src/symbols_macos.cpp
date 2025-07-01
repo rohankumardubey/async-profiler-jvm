@@ -28,30 +28,41 @@
 
 class MachOParser {
   private:
-    NativeCodeCache* _cc;
+    CodeCache* _cc;
     const mach_header* _image_base;
 
     static const char* add(const void* base, uint64_t offset) {
         return (const char*)base + offset;
     }
 
+    void findGlobalOffsetTable(const segment_command_64* sc) {
+        const section_64* section = (const section_64*)add(sc, sizeof(segment_command_64));
+        for (uint32_t i = 0; i < sc->nsects; i++) {
+            if (strcmp(section->sectname, "__la_symbol_ptr") == 0) {
+                _cc->setGlobalOffsetTable(add(_image_base, section->addr), section->size);
+                break;
+            }
+            section++;
+        }
+    }
+
     void loadSymbols(const symtab_command* symtab, const char* text_base, const char* link_base) {
-        const nlist_64* symbol_table = (const nlist_64*)add(link_base, symtab->symoff);
+        const nlist_64* sym = (const nlist_64*)add(link_base, symtab->symoff);
         const char* str_table = add(link_base, symtab->stroff);
 
         for (uint32_t i = 0; i < symtab->nsyms; i++) {
-            nlist_64 sym = symbol_table[i];
-            if ((sym.n_type & 0xee) == 0x0e && sym.n_value != 0) {
-                const char* addr = text_base + sym.n_value;
-                const char* name = str_table + sym.n_un.n_strx;
+            if ((sym->n_type & 0xee) == 0x0e && sym->n_value != 0) {
+                const char* addr = text_base + sym->n_value;
+                const char* name = str_table + sym->n_un.n_strx;
                 if (name[0] == '_') name++;
                 _cc->add(addr, 0, name);
             }
+            sym++;
         }
     }
 
   public:
-    MachOParser(NativeCodeCache* cc, const mach_header* image_base) : _cc(cc), _image_base(image_base) {
+    MachOParser(CodeCache* cc, const mach_header* image_base) : _cc(cc), _image_base(image_base) {
     }
 
     bool parse() {
@@ -72,11 +83,16 @@ class MachOParser {
                 if ((sc->initprot & 4) != 0) {
                     if (text_base == UNDEFINED || strcmp(sc->segname, "__TEXT") == 0) {
                         text_base = (const char*)_image_base - sc->vmaddr;
+                        _cc->setTextBase(text_base);
                         _cc->updateBounds(_image_base, add(_image_base, sc->vmsize));
                     }
                 } else if ((sc->initprot & 7) == 1) {
                     if (link_base == UNDEFINED || strcmp(sc->segname, "__LINKEDIT") == 0) {
                         link_base = text_base + sc->vmaddr - sc->fileoff;
+                    }
+                } else if ((sc->initprot & 2) != 0) {
+                    if (strcmp(sc->segname, "__DATA") == 0) {
+                        findGlobalOffsetTable(sc);
                     }
                 }
             } else if (lc->cmd == LC_SYMTAB) {
@@ -98,10 +114,10 @@ Mutex Symbols::_parse_lock;
 std::set<const void*> Symbols::_parsed_libraries;
 bool Symbols::_have_kernel_symbols = false;
 
-void Symbols::parseKernelSymbols(NativeCodeCache* cc) {
+void Symbols::parseKernelSymbols(CodeCache* cc) {
 }
 
-void Symbols::parseLibraries(NativeCodeCache** array, volatile int& count, int size, bool kernel_symbols) {
+void Symbols::parseLibraries(CodeCache** array, volatile int& count, int size, bool kernel_symbols) {
     MutexLocker ml(_parse_lock);
     uint32_t images = _dyld_image_count();
 
@@ -119,7 +135,7 @@ void Symbols::parseLibraries(NativeCodeCache** array, volatile int& count, int s
             continue;
         }
 
-        NativeCodeCache* cc = new NativeCodeCache(path);
+        CodeCache* cc = new CodeCache(path, count);
         MachOParser parser(cc, image_base);
         if (!parser.parse()) {
             Log::warn("Could not parse symbols from %s", path);
@@ -130,6 +146,10 @@ void Symbols::parseLibraries(NativeCodeCache** array, volatile int& count, int s
         array[count] = cc;
         atomicInc(count);
     }
+}
+
+void Symbols::makePatchable(CodeCache* cc) {
+    // Global Offset Table is always writable
 }
 
 #endif // __APPLE__
