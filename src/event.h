@@ -52,4 +52,10 @@ class LockEvent : public Event {
     long long _timeout;
 };
 
+class MallocEvent : public Event {
+  public:
+    uintptr_t _address;
+    u64 _size;
+};
+
 #endif // _EVENT_H

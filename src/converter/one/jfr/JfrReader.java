@@ -20,6 +20,7 @@ import one.jfr.event.AllocationSample;
 import one.jfr.event.ContendedLock;
 import one.jfr.event.Event;
 import one.jfr.event.ExecutionSample;
+import one.jfr.event.MallocEvent;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -61,17 +62,20 @@ public class JfrReader implements Closeable {
     public final Dictionary<StackTrace> stackTraces = new Dictionary<>();
     public final Map<Integer, String> frameTypes = new HashMap<>();
     public final Map<Integer, String> threadStates = new HashMap<>();
-    public final Map<String, String> settings = new HashMap<>();
 
-    private int executionSample;
-    private int nativeMethodSample;
-    private int allocationInNewTLAB;
-    private int allocationOutsideTLAB;
-    private int allocationSample;
-    private int monitorEnter;
-    private int threadPark;
-    private int activeSetting;
-    private boolean activeSettingHasStack;
+
+    private final int executionSample;
+    private final int nativeMethodSample;
+    private final int allocationInNewTLAB;
+    private final int allocationOutsideTLAB;
+    private final int monitorEnter;
+    private final int threadPark;
+    private final int malloc;
+    private final int free;
+
+    private final boolean hasPreviousOwner;
+    private final boolean hasParkUntil;
+
 
     public JfrReader(String fileName) throws IOException {
         this.ch = FileChannel.open(Paths.get(fileName), StandardOpenOption.READ);
@@ -82,6 +86,27 @@ public class JfrReader implements Closeable {
         if (!readChunk(0)) {
             throw new IOException("Incomplete JFR file");
         }
+
+
+        this.startNanos = times[0];
+        this.durationNanos = times[1] - startNanos;
+        this.startTicks = times[2];
+        this.ticksPerSec = times[3];
+
+        this.executionSample = getTypeId("jdk.ExecutionSample");
+        this.nativeMethodSample = getTypeId("jdk.NativeMethodSample");
+        this.allocationInNewTLAB = getTypeId("jdk.ObjectAllocationInNewTLAB");
+        this.allocationOutsideTLAB = getTypeId("jdk.ObjectAllocationOutsideTLAB");
+        this.monitorEnter = getTypeId("jdk.JavaMonitorEnter");
+        this.threadPark = getTypeId("jdk.ThreadPark");
+        this.malloc = getTypeId("profiler.Malloc");
+        this.free = getTypeId("profiler.Free");
+
+        this.hasPreviousOwner = hasField("jdk.JavaMonitorEnter", "previousOwner");
+        this.hasParkUntil = hasField("jdk.ThreadPark", "until");
+
+        seek(CHUNK_HEADER_SIZE);
+
     }
 
     @Override
@@ -133,9 +158,11 @@ public class JfrReader implements Closeable {
             } else if (type == monitorEnter) {
                 if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(false);
             } else if (type == threadPark) {
-                if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(true);
-            } else if (type == activeSetting) {
-                readActiveSetting();
+                if (cls == null || cls == ContendedLock.class) return (E) readContendedLock(true, hasParkUntil);
+            } else if (type == malloc) {
+                if (cls == null || cls == MallocEvent.class) return (E) readMallocEvent(true);
+            } else if (type == free) {
+                if (cls == null || cls == MallocEvent.class) return (E) readMallocEvent(false);
             }
 
             if ((pos += size) <= buf.limit()) {
@@ -177,16 +204,19 @@ public class JfrReader implements Closeable {
         return new ContendedLock(time, tid, stackTraceId, duration, classId);
     }
 
-    private void readActiveSetting() {
+    private MallocEvent readMallocEvent(boolean hasSize) {
         long time = getVarlong();
-        long duration = getVarlong();
         int tid = getVarint();
-        if (activeSettingHasStack) getVarint();
-        long id = getVarlong();
-        String name = getString();
-        String value = getString();
-        settings.put(name, value);
+        int stackTraceId = getVarint();
+        long address = getVarlong();
+        long size = hasSize ? getVarlong() : 0;
+        return new MallocEvent(time, tid, stackTraceId, address, size);
     }
+
+    private long readChunk(long chunkStart, long[] times) throws IOException {
+        seek(chunkStart);
+        ensureBytes(CHUNK_HEADER_SIZE);
+
 
     private boolean readChunk(int pos) throws IOException {
         if (pos + CHUNK_HEADER_SIZE > buf.limit() || buf.getInt(pos) != CHUNK_SIGNATURE) {

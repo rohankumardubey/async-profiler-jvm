@@ -28,6 +28,7 @@ const char* const EVENT_ALLOC  = "alloc";
 const char* const EVENT_LOCK   = "lock";
 const char* const EVENT_WALL   = "wall";
 const char* const EVENT_ITIMER = "itimer";
+const char* const EVENT_MALLOC = "nativemem";
 
 enum Action {
     ACTION_NONE,

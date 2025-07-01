@@ -1126,6 +1126,19 @@ class Recording {
         buf->put8(start, buf->offset() - start);
     }
 
+    void recordMalloc(Buffer* buf, int tid, u32 call_trace_id, MallocEvent* event) {
+        int start = buf->skip(1);
+        buf->put8(event->_size != 0 ? T_MALLOC : T_FREE);
+        buf->putVar64(OS::nanotime());
+        buf->putVar32(tid);
+        buf->putVar32(call_trace_id);
+        buf->putVar64(event->_address);
+        if (event->_size != 0) {
+            buf->putVar64(event->_size);
+        }
+        buf->put8(start, buf->offset() - start);
+    }
+
     void recordCpuLoad(Buffer* buf, float proc_user, float proc_system, float machine_total) {
         int start = buf->skip(1);
         buf->put8(T_CPU_LOAD);
@@ -1289,6 +1302,9 @@ void FlightRecorder::recordEvent(int lock_index, int tid, u32 call_trace_id,
         switch (event_type) {
             case 0:
                 _rec->recordExecutionSample(buf, tid, call_trace_id, (ExecutionEvent*)event);
+                break;
+            case BCI_MALLOC:
+                _rec->recordMalloc(buf, tid, call_trace_id, (MallocEvent*)event);
                 break;
             case BCI_ALLOC:
                 _rec->recordAllocationInNewTLAB(buf, tid, call_trace_id, (AllocEvent*)event);

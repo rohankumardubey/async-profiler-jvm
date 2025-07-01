@@ -151,16 +151,41 @@ where `getProperty` method is called from.
 Only non-native Java methods are supported. To profile a native method,
 use hardware breakpoint event instead, e.g. `-e Java_java_lang_Throwable_fillInStackTrace`
 
-**Be aware** that if you attach async-profiler at runtime, the first instrumentation
-of a non-native Java method may cause the [deoptimization](https://github.com/openjdk/jdk/blob/bf2e9ee9d321ed289466b2410f12ad10504d01a2/src/hotspot/share/prims/jvmtiRedefineClasses.cpp#L4092-L4096)
-of all compiled methods. The subsequent instrumentation flushes only the _dependent code_.
 
-The massive CodeCache flush doesn't occur if attaching async-profiler as an agent.
+## Finding native memory leaks
 
-Here are some useful native methods that you may want to profile:
-* ```G1CollectedHeap::humongous_obj_allocate``` - trace the _humongous allocation_ of the G1 GC,
-* ```JVM_StartThread``` - trace the new thread creation,
-* ```Java_java_lang_ClassLoader_defineClass1``` - trace class loading.
+A new experimental feature of async-profiler is to trace native memory allocations.
+
+Although it [was possible](https://stackoverflow.com/a/53598622/3448419) to profile
+`malloc` and `mmap` calls in Java context before, this was not always helpful.
+A large amount of allocations does not yet mean a leak, in case all the allocated memory
+is released on time.
+
+The new profiling mode `nativemem` records `malloc` and `free` calls
+with the addresses, so that later these calls can be matched with each other.
+This helps to focus only on unpaired allocations, which are the likely source
+of a memory leak.
+
+How to run:
+```
+LD_PRELOAD=/path/to/libasyncProfiler.so java -agentlib:asyncProfiler=start,event=nativemem,file=malloc.jfr <Your App>
+```
+
+Stop profiling at any time by `profiler.sh stop` command, or wait until the application exits.
+Then post-process the output using `MallocReport` tool included in the async-profiler bundle:
+
+```
+java -cp converter.jar MallocReport malloc.jfr malloc.html
+```
+
+Generated Flame Graph will show those native allocations that have no corresponding `free` calls.
+
+![Malloc Profile](https://github.com/jvm-profiling-tools/async-profiler/blob/malloc/demo/malloc.png)
+
+The overhead of `nativemem` profiling depends on the number of native allocations,
+but is usually small enough even for production use. If required, the overhead can be reduced
+by configuring the profiling interval. E.g. if you add `interval=1m` profiler option,
+allocation samples will be limited to at most one sample per allocated megabyte.
 
 ## Building
 
